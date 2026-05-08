@@ -11,18 +11,15 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"sort"
 	"testing"
 
 	"github.com/absmach/magistrala/bootstrap"
+	bootstraphasher "github.com/absmach/magistrala/bootstrap/hasher"
 	mocks "github.com/absmach/magistrala/bootstrap/mocks"
 	"github.com/absmach/magistrala/internal/testsutil"
 	smqauthn "github.com/absmach/magistrala/pkg/authn"
 	"github.com/absmach/magistrala/pkg/errors"
 	svcerr "github.com/absmach/magistrala/pkg/errors/service"
-	policysvc "github.com/absmach/magistrala/pkg/policies"
-	policymocks "github.com/absmach/magistrala/pkg/policies/mocks"
-	mgsdk "github.com/absmach/magistrala/pkg/sdk"
 	sdkmocks "github.com/absmach/magistrala/pkg/sdk/mocks"
 	"github.com/absmach/magistrala/pkg/uuid"
 	"github.com/stretchr/testify/assert"
@@ -31,46 +28,41 @@ import (
 
 const (
 	validToken      = "validToken"
-	invalidToken    = "invalid"
 	invalidDomainID = "invalid"
-	email           = "test@example.com"
 	unknown         = "unknown"
-	channelsNum     = 3
-	instanceID      = "5de9b29a-feb9-11ed-be56-0242ac120002"
 	validID         = "d4ebb847-5d0e-4e46-bdd9-b6aceaaa3a22"
 )
 
 var (
 	encKey   = []byte("1234567891011121")
 	domainID = testsutil.GenerateUUID(&testing.T{})
-	channel  = bootstrap.Channel{
-		ID:       testsutil.GenerateUUID(&testing.T{}),
-		Name:     "name",
-		Metadata: map[string]any{"name": "value"},
-	}
 
 	config = bootstrap.Config{
-		ClientID:     testsutil.GenerateUUID(&testing.T{}),
-		ClientSecret: testsutil.GenerateUUID(&testing.T{}),
-		ExternalID:   testsutil.GenerateUUID(&testing.T{}),
-		ExternalKey:  testsutil.GenerateUUID(&testing.T{}),
-		Channels:     []bootstrap.Channel{channel},
-		Content:      "config",
+		ID:          testsutil.GenerateUUID(&testing.T{}),
+		ExternalID:  testsutil.GenerateUUID(&testing.T{}),
+		ExternalKey: testsutil.GenerateUUID(&testing.T{}),
+		Content:     "config",
 	}
 )
 
 var (
-	boot     *mocks.ConfigRepository
-	policies *policymocks.Service
-	sdk      *sdkmocks.SDK
+	boot         *mocks.ConfigRepository
+	sdk          *sdkmocks.SDK
+	profileRepo  *mocks.ProfileRepository
+	bindingStore *mocks.BindingStore
+	resolver     *mocks.BindingResolver
+	renderer     *mocks.Renderer
 )
 
 func newService() bootstrap.Service {
 	boot = new(mocks.ConfigRepository)
-	policies = new(policymocks.Service)
 	sdk = new(sdkmocks.SDK)
+	profileRepo = new(mocks.ProfileRepository)
+	bindingStore = new(mocks.BindingStore)
+	resolver = new(mocks.BindingResolver)
+	renderer = new(mocks.Renderer)
 	idp := uuid.NewMock()
-	return bootstrap.New(policies, boot, sdk, encKey, idp)
+	return bootstrap.New(boot, profileRepo, bindingStore, resolver, renderer, sdk, bootstraphasher.New(), encKey, idp)
 }
 
 func enc(in []byte) ([]byte, error) {
@@ -92,27 +84,17 @@ func TestAdd(t *testing.T) {
 	svc := newService()
 
 	neID := config
-	neID.ClientID = "non-existent"
-
-	wrongChannels := config
-	ch := channel
-	ch.ID = "invalid"
-	wrongChannels.Channels = append(wrongChannels.Channels, ch)
+	neID.ID = "non-existent"
 
 	cases := []struct {
-		desc            string
-		config          bootstrap.Config
-		token           string
-		session         smqauthn.Session
-		userID          string
-		domainID        string
-		clientErr       error
-		createClientErr error
-		channelErr      error
-		listExistingErr error
-		saveErr         error
-		deleteClientErr error
-		err             error
+		desc     string
+		config   bootstrap.Config
+		token    string
+		session  smqauthn.Session
+		userID   string
+		domainID string
+		saveErr  error
+		err      error
 	}{
 		{
 			desc:     "add a new config",
@@ -123,22 +105,12 @@ func TestAdd(t *testing.T) {
 			err:      nil,
 		},
 		{
-			desc:      "add a config with an invalid ID",
-			config:    neID,
-			token:     validToken,
-			userID:    validID,
-			domainID:  domainID,
-			clientErr: errors.NewSDKError(svcerr.ErrNotFound),
-			err:       svcerr.ErrNotFound,
-		},
-		{
-			desc:            "add a config with invalid list of channels",
-			config:          wrongChannels,
-			token:           validToken,
-			userID:          validID,
-			domainID:        domainID,
-			listExistingErr: svcerr.ErrMalformedEntity,
-			err:             svcerr.ErrMalformedEntity,
+			desc:     "add a config with an invalid ID",
+			config:   neID,
+			token:    validToken,
+			userID:   validID,
+			domainID: domainID,
+			err:      nil,
 		},
 		{
 			desc:     "add empty config",
@@ -152,18 +124,10 @@ func TestAdd(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
 			tc.session = smqauthn.Session{UserID: tc.userID, DomainID: tc.domainID, DomainUserID: validID}
-			repoCall := sdk.On("Client", mock.Anything, tc.config.ClientID, mock.Anything, tc.token).Return(mgsdk.Client{ID: tc.config.ClientID, Credentials: mgsdk.ClientCredentials{Secret: tc.config.ClientSecret}}, tc.clientErr)
-			repoCall1 := sdk.On("CreateClient", mock.Anything, mock.Anything, tc.domainID, tc.token).Return(mgsdk.Client{}, tc.createClientErr)
-			repoCall2 := sdk.On("DeleteClient", mock.Anything, tc.config.ClientID, tc.domainID, tc.token).Return(tc.deleteClientErr)
-			repoCall3 := boot.On("ListExisting", context.Background(), tc.domainID, mock.Anything).Return(tc.config.Channels, tc.listExistingErr)
-			repoCall4 := boot.On("Save", context.Background(), mock.Anything, mock.Anything).Return(mock.Anything, tc.saveErr)
+			repoCall3 := boot.On("Save", context.Background(), mock.Anything).Return(mock.Anything, tc.saveErr)
 			_, err := svc.Add(context.Background(), tc.session, tc.token, tc.config)
 			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			repoCall.Unset()
-			repoCall1.Unset()
-			repoCall2.Unset()
 			repoCall3.Unset()
-			repoCall4.Unset()
 		})
 	}
 }
@@ -186,7 +150,7 @@ func TestView(t *testing.T) {
 	}{
 		{
 			desc:         "view an existing config",
-			configID:     config.ClientID,
+			configID:     config.ID,
 			userID:       validID,
 			clientDomain: domainID,
 			domain:       domainID,
@@ -205,7 +169,7 @@ func TestView(t *testing.T) {
 		},
 		{
 			desc:         "view a config with invalid domain",
-			configID:     config.ClientID,
+			configID:     config.ID,
 			userID:       validID,
 			clientDomain: invalidDomainID,
 			domain:       invalidDomainID,
@@ -230,16 +194,13 @@ func TestUpdate(t *testing.T) {
 	svc := newService()
 
 	c := config
-	ch := channel
-	ch.ID = "2"
-	c.Channels = append(c.Channels, ch)
 
 	modifiedCreated := c
 	modifiedCreated.Content = "new-config"
 	modifiedCreated.Name = "new name"
 
 	nonExisting := c
-	nonExisting.ClientID = unknown
+	nonExisting.ID = unknown
 
 	cases := []struct {
 		desc      string
@@ -252,7 +213,7 @@ func TestUpdate(t *testing.T) {
 		err       error
 	}{
 		{
-			desc:     "update a config with state Created",
+			desc:     "update a config with status Created",
 			config:   modifiedCreated,
 			token:    validToken,
 			userID:   validID,
@@ -294,9 +255,6 @@ func TestUpdateCert(t *testing.T) {
 	svc := newService()
 
 	c := config
-	ch := channel
-	ch.ID = "2"
-	c.Channels = append(c.Channels, ch)
 
 	cases := []struct {
 		desc            string
@@ -304,7 +262,7 @@ func TestUpdateCert(t *testing.T) {
 		session         smqauthn.Session
 		userID          string
 		domainID        string
-		clientID        string
+		configID        string
 		clientCert      string
 		clientKey       string
 		caCert          string
@@ -318,24 +276,22 @@ func TestUpdateCert(t *testing.T) {
 			desc:       "update certs for the valid config",
 			userID:     validID,
 			domainID:   domainID,
-			clientID:   c.ClientID,
+			configID:   c.ID,
 			clientCert: "newCert",
 			clientKey:  "newKey",
 			caCert:     "newCert",
 			token:      validToken,
 			expectedConfig: bootstrap.Config{
-				Name:         c.Name,
-				ClientSecret: c.ClientSecret,
-				Channels:     c.Channels,
-				ExternalID:   c.ExternalID,
-				ExternalKey:  c.ExternalKey,
-				Content:      c.Content,
-				State:        c.State,
-				DomainID:     c.DomainID,
-				ClientID:     c.ClientID,
-				ClientCert:   "newCert",
-				CACert:       "newCert",
-				ClientKey:    "newKey",
+				Name:        c.Name,
+				ExternalID:  c.ExternalID,
+				ExternalKey: c.ExternalKey,
+				Content:     c.Content,
+				Status:      c.Status,
+				DomainID:    c.DomainID,
+				ID:          c.ID,
+				ClientCert:  "newCert",
+				CACert:      "newCert",
+				ClientKey:   "newKey",
 			},
 			err: nil,
 		},
@@ -343,7 +299,7 @@ func TestUpdateCert(t *testing.T) {
 			desc:           "update cert for a non-existing config",
 			userID:         validID,
 			domainID:       domainID,
-			clientID:       "empty",
+			configID:       "empty",
 			clientCert:     "newCert",
 			clientKey:      "newKey",
 			caCert:         "newCert",
@@ -358,92 +314,10 @@ func TestUpdateCert(t *testing.T) {
 		t.Run(tc.desc, func(t *testing.T) {
 			tc.session = smqauthn.Session{UserID: tc.userID, DomainID: tc.domainID, DomainUserID: validID}
 			repoCall := boot.On("UpdateCert", context.Background(), mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(tc.expectedConfig, tc.updateErr)
-			cfg, err := svc.UpdateCert(context.Background(), tc.session, tc.clientID, tc.clientCert, tc.clientKey, tc.caCert)
+			cfg, err := svc.UpdateCert(context.Background(), tc.session, tc.configID, tc.clientCert, tc.clientKey, tc.caCert)
 			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			sort.Slice(cfg.Channels, func(i, j int) bool {
-				return cfg.Channels[i].ID < cfg.Channels[j].ID
-			})
-			sort.Slice(tc.expectedConfig.Channels, func(i, j int) bool {
-				return tc.expectedConfig.Channels[i].ID < tc.expectedConfig.Channels[j].ID
-			})
 			assert.Equal(t, tc.expectedConfig, cfg, fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.expectedConfig, cfg))
 			repoCall.Unset()
-		})
-	}
-}
-
-func TestUpdateConnections(t *testing.T) {
-	svc := newService()
-
-	c := config
-	c.State = bootstrap.Inactive
-
-	activeConf := config
-	activeConf.State = bootstrap.Active
-
-	ch := channel
-
-	cases := []struct {
-		desc        string
-		token       string
-		session     smqauthn.Session
-		id          string
-		state       bootstrap.State
-		userID      string
-		domainID    string
-		connections []string
-		updateErr   error
-		clientErr   error
-		channelErr  error
-		retrieveErr error
-		listErr     error
-		err         error
-	}{
-		{
-			desc:        "update connections for config with state Inactive",
-			token:       validToken,
-			userID:      validID,
-			domainID:    domainID,
-			id:          c.ClientID,
-			state:       c.State,
-			connections: []string{ch.ID},
-			err:         nil,
-		},
-		{
-			desc:        "update connections for config with state Active",
-			token:       validToken,
-			userID:      validID,
-			domainID:    domainID,
-			id:          activeConf.ClientID,
-			state:       activeConf.State,
-			connections: []string{ch.ID},
-			err:         nil,
-		},
-		{
-			desc:        "update connections with invalid channels",
-			token:       validToken,
-			userID:      validID,
-			domainID:    domainID,
-			id:          c.ClientID,
-			connections: []string{"wrong"},
-			channelErr:  errors.NewSDKError(svcerr.ErrNotFound),
-			err:         svcerr.ErrNotFound,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.desc, func(t *testing.T) {
-			tc.session = smqauthn.Session{UserID: tc.userID, DomainID: tc.domainID, DomainUserID: validID}
-			sdkCall := sdk.On("Channel", mock.Anything, mock.Anything, tc.domainID, tc.token).Return(mgsdk.Channel{}, tc.channelErr)
-			repoCall := boot.On("RetrieveByID", context.Background(), tc.domainID, tc.id).Return(c, tc.retrieveErr)
-			repoCall1 := boot.On("ListExisting", context.Background(), mock.Anything, mock.Anything, mock.Anything).Return(c.Channels, tc.listErr)
-			repoCall2 := boot.On("UpdateConnections", context.Background(), mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(tc.updateErr)
-			err := svc.UpdateConnections(context.Background(), tc.session, tc.token, tc.id, tc.connections)
-			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			sdkCall.Unset()
-			repoCall.Unset()
-			repoCall1.Unset()
-			repoCall2.Unset()
 		})
 	}
 }
@@ -459,24 +333,22 @@ func TestList(t *testing.T) {
 		c.ExternalKey = testsutil.GenerateUUID(t)
 		c.Name = fmt.Sprintf("%s-%d", config.Name, i)
 		if i == 41 {
-			c.State = bootstrap.Active
+			c.Status = bootstrap.Active
 		}
 		saved = append(saved, c)
 	}
 	cases := []struct {
-		desc                string
-		config              bootstrap.ConfigsPage
-		filter              bootstrap.Filter
-		offset              uint64
-		limit               uint64
-		token               string
-		session             smqauthn.Session
-		userID              string
-		domainID            string
-		listObjectsResponse policysvc.PolicyPage
-		listObjectsErr      error
-		retrieveErr         error
-		err                 error
+		desc        string
+		config      bootstrap.ConfigsPage
+		filter      bootstrap.Filter
+		offset      uint64
+		limit       uint64
+		token       string
+		session     smqauthn.Session
+		userID      string
+		domainID    string
+		retrieveErr error
+		err         error
 	}{
 		{
 			desc: "list configs successfully as super admin",
@@ -496,17 +368,16 @@ func TestList(t *testing.T) {
 			err:      nil,
 		},
 		{
-			desc:                "list configs with failed super admin check",
-			config:              bootstrap.ConfigsPage{},
-			filter:              bootstrap.Filter{},
-			token:               validID,
-			session:             smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
-			userID:              validID,
-			domainID:            domainID,
-			listObjectsResponse: policysvc.PolicyPage{},
-			offset:              0,
-			limit:               10,
-			err:                 nil,
+			desc:     "list configs with failed super admin check",
+			config:   bootstrap.ConfigsPage{},
+			filter:   bootstrap.Filter{},
+			token:    validID,
+			session:  smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
+			userID:   validID,
+			domainID: domainID,
+			offset:   0,
+			limit:    10,
+			err:      nil,
 		},
 		{
 			desc: "list configs successfully as domain admin",
@@ -516,15 +387,14 @@ func TestList(t *testing.T) {
 				Limit:   10,
 				Configs: saved[0:10],
 			},
-			filter:              bootstrap.Filter{},
-			token:               validToken,
-			userID:              validID,
-			domainID:            domainID,
-			session:             smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID, SuperAdmin: true},
-			listObjectsResponse: policysvc.PolicyPage{},
-			offset:              0,
-			limit:               10,
-			err:                 nil,
+			filter:   bootstrap.Filter{},
+			token:    validToken,
+			userID:   validID,
+			domainID: domainID,
+			session:  smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID, SuperAdmin: true},
+			offset:   0,
+			limit:    10,
+			err:      nil,
 		},
 		{
 			desc: "list configs successfully as non admin",
@@ -534,15 +404,14 @@ func TestList(t *testing.T) {
 				Limit:   10,
 				Configs: saved[0:10],
 			},
-			filter:              bootstrap.Filter{},
-			token:               validToken,
-			userID:              validID,
-			domainID:            domainID,
-			session:             smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
-			listObjectsResponse: policysvc.PolicyPage{Policies: []string{"test", "test"}},
-			offset:              0,
-			limit:               10,
-			err:                 nil,
+			filter:   bootstrap.Filter{},
+			token:    validToken,
+			userID:   validID,
+			domainID: domainID,
+			session:  smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
+			offset:   0,
+			limit:    10,
+			err:      nil,
 		},
 		{
 			desc: "list configs with specified name as super admin",
@@ -586,15 +455,14 @@ func TestList(t *testing.T) {
 				Limit:   100,
 				Configs: saved[95:96],
 			},
-			filter:              bootstrap.Filter{PartialMatch: map[string]string{"name": "95"}},
-			token:               validToken,
-			userID:              validID,
-			domainID:            domainID,
-			session:             smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
-			listObjectsResponse: policysvc.PolicyPage{Policies: []string{"test", "test"}},
-			offset:              0,
-			limit:               100,
-			err:                 nil,
+			filter:   bootstrap.Filter{PartialMatch: map[string]string{"name": "95"}},
+			token:    validToken,
+			userID:   validID,
+			domainID: domainID,
+			session:  smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
+			offset:   0,
+			limit:    100,
+			err:      nil,
 		},
 		{
 			desc: "list last page as super admin",
@@ -638,25 +506,24 @@ func TestList(t *testing.T) {
 				Limit:   10,
 				Configs: saved[95:],
 			},
-			filter:              bootstrap.Filter{},
-			token:               validToken,
-			userID:              validID,
-			domainID:            domainID,
-			session:             smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
-			listObjectsResponse: policysvc.PolicyPage{Policies: []string{"test", "test"}},
-			offset:              95,
-			limit:               10,
-			err:                 nil,
+			filter:   bootstrap.Filter{},
+			token:    validToken,
+			userID:   validID,
+			domainID: domainID,
+			session:  smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
+			offset:   95,
+			limit:    10,
+			err:      nil,
 		},
 		{
-			desc: "list configs with Active state as super admin",
+			desc: "list configs with Active status as super admin",
 			config: bootstrap.ConfigsPage{
 				Total:   1,
 				Offset:  35,
 				Limit:   20,
 				Configs: []bootstrap.Config{saved[41]},
 			},
-			filter:   bootstrap.Filter{FullMatch: map[string]string{"state": bootstrap.Active.String()}},
+			filter:   bootstrap.Filter{FullMatch: map[string]string{"status": bootstrap.Active.String()}},
 			token:    validToken,
 			userID:   validID,
 			domainID: domainID,
@@ -666,14 +533,14 @@ func TestList(t *testing.T) {
 			err:      nil,
 		},
 		{
-			desc: "list configs with Active state as domain admin",
+			desc: "list configs with Active status as domain admin",
 			config: bootstrap.ConfigsPage{
 				Total:   1,
 				Offset:  35,
 				Limit:   20,
 				Configs: []bootstrap.Config{saved[41]},
 			},
-			filter:   bootstrap.Filter{FullMatch: map[string]string{"state": bootstrap.Active.String()}},
+			filter:   bootstrap.Filter{FullMatch: map[string]string{"status": bootstrap.Active.String()}},
 			token:    validToken,
 			userID:   validID,
 			domainID: domainID,
@@ -683,54 +550,44 @@ func TestList(t *testing.T) {
 			err:      nil,
 		},
 		{
-			desc: "list configs with Active state as non admin",
+			desc: "list configs with Active status as non admin",
 			config: bootstrap.ConfigsPage{
 				Total:   1,
 				Offset:  35,
 				Limit:   20,
 				Configs: []bootstrap.Config{saved[41]},
 			},
-			filter:              bootstrap.Filter{FullMatch: map[string]string{"state": bootstrap.Active.String()}},
-			token:               validToken,
-			userID:              validID,
-			domainID:            domainID,
-			session:             smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
-			listObjectsResponse: policysvc.PolicyPage{Policies: []string{"test", "test"}},
-			offset:              35,
-			limit:               20,
-			err:                 nil,
+			filter:   bootstrap.Filter{FullMatch: map[string]string{"status": bootstrap.Active.String()}},
+			token:    validToken,
+			userID:   validID,
+			domainID: domainID,
+			session:  smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
+			offset:   35,
+			limit:    20,
+			err:      nil,
 		},
 		{
-			desc:                "list configs with failed to list objects",
-			config:              bootstrap.ConfigsPage{},
-			filter:              bootstrap.Filter{},
-			offset:              0,
-			limit:               10,
-			token:               validToken,
-			userID:              validID,
-			domainID:            domainID,
-			session:             smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
-			listObjectsResponse: policysvc.PolicyPage{},
-			listObjectsErr:      svcerr.ErrNotFound,
-			err:                 svcerr.ErrNotFound,
+			desc:     "list configs with empty result",
+			config:   bootstrap.ConfigsPage{},
+			filter:   bootstrap.Filter{},
+			offset:   0,
+			limit:    10,
+			token:    validToken,
+			userID:   validID,
+			domainID: domainID,
+			session:  smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
+			err:      nil,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
-			policyCall := policies.On("ListAllObjects", mock.Anything, policysvc.Policy{
-				SubjectType: policysvc.UserType,
-				Subject:     tc.userID,
-				Permission:  policysvc.ViewPermission,
-				ObjectType:  policysvc.ClientType,
-			}).Return(tc.listObjectsResponse, tc.listObjectsErr)
-			repoCall := boot.On("RetrieveAll", context.Background(), mock.Anything, mock.Anything, tc.filter, tc.offset, tc.limit).Return(tc.config, tc.retrieveErr)
+			repoCall := boot.On("RetrieveAll", context.Background(), mock.Anything, tc.filter, tc.offset, tc.limit).Return(tc.config, tc.retrieveErr)
 
 			result, err := svc.List(context.Background(), tc.session, tc.filter, tc.offset, tc.limit)
 			assert.ElementsMatch(t, tc.config.Configs, result.Configs, fmt.Sprintf("%s: expected %v got %v", tc.desc, tc.config.Configs, result.Configs))
 			assert.Equal(t, tc.config.Total, result.Total, fmt.Sprintf("%s: expected %v got %v", tc.desc, tc.config.Total, result.Total))
 			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			policyCall.Unset()
 			repoCall.Unset()
 		})
 	}
@@ -752,7 +609,7 @@ func TestRemove(t *testing.T) {
 	}{
 		{
 			desc:     "remove an existing config",
-			id:       c.ClientID,
+			id:       c.ID,
 			token:    validToken,
 			userID:   validID,
 			domainID: domainID,
@@ -760,7 +617,7 @@ func TestRemove(t *testing.T) {
 		},
 		{
 			desc:     "remove removed config",
-			id:       c.ClientID,
+			id:       c.ID,
 			token:    validToken,
 			userID:   validID,
 			domainID: domainID,
@@ -768,7 +625,7 @@ func TestRemove(t *testing.T) {
 		},
 		{
 			desc:      "remove a config with failed remove",
-			id:        c.ClientID,
+			id:        c.ID,
 			token:     validToken,
 			userID:    validID,
 			domainID:  domainID,
@@ -792,6 +649,7 @@ func TestBootstrap(t *testing.T) {
 	svc := newService()
 
 	c := config
+	c.Status = bootstrap.Active
 	e, err := enc([]byte(c.ExternalKey))
 	assert.Nil(t, err, fmt.Sprintf("Encrypting external key expected to succeed: %s.\n", err))
 
@@ -858,256 +716,899 @@ func TestBootstrap(t *testing.T) {
 	}
 }
 
-func TestChangeState(t *testing.T) {
+func TestBootstrapRender(t *testing.T) {
+	profile := bootstrap.Profile{
+		ID:              testsutil.GenerateUUID(&testing.T{}),
+		DomainID:        domainID,
+		Name:            "gateway-profile",
+		TemplateFormat:  bootstrap.TemplateFormatGoTemplate,
+		ContentTemplate: `{"mode":"profile"}`,
+	}
+	bindings := []bootstrap.BindingSnapshot{
+		{
+			ConfigID:   config.ID,
+			Slot:       "mqtt_client",
+			Type:       "client",
+			ResourceID: config.ID,
+			Snapshot: map[string]any{
+				"id": config.ID,
+			},
+		},
+	}
+
+	cases := []struct {
+		desc        string
+		cfg         bootstrap.Config
+		rendererOut []byte
+		rendererErr error
+		rendered    string
+		err         error
+	}{
+		{
+			desc: "bootstrap renders assigned profile content",
+			cfg: func() bootstrap.Config {
+				cfg := config
+				cfg.DomainID = domainID
+				cfg.ProfileID = profile.ID
+				cfg.Status = bootstrap.Active
+				cfg.Content = "legacy"
+				return cfg
+			}(),
+			rendererOut: []byte(`{"mode":"profile"}`),
+			rendered:    `{"mode":"profile"}`,
+		},
+		{
+			desc: "bootstrap falls back to legacy content when no profile is assigned",
+			cfg: func() bootstrap.Config {
+				cfg := config
+				cfg.DomainID = domainID
+				cfg.Status = bootstrap.Active
+				cfg.Content = "legacy"
+				return cfg
+			}(),
+			rendered: "legacy",
+		},
+		{
+			desc: "bootstrap fails when renderer fails",
+			cfg: func() bootstrap.Config {
+				cfg := config
+				cfg.DomainID = domainID
+				cfg.ProfileID = profile.ID
+				cfg.Status = bootstrap.Active
+				return cfg
+			}(),
+			rendererErr: errors.New("render failed"),
+			err:         errors.New("render failed"),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			svc := newService()
+			repoCall := boot.On("RetrieveByExternalID", context.Background(), tc.cfg.ExternalID).Return(tc.cfg, nil)
+
+			var prCall, bsCall, rndCall *mock.Call
+			if tc.cfg.ProfileID != "" {
+				prCall = profileRepo.On("RetrieveByID", context.Background(), tc.cfg.DomainID, tc.cfg.ProfileID).Return(profile, nil)
+				bsCall = bindingStore.On("Retrieve", context.Background(), tc.cfg.ID).Return(bindings, nil)
+				rndCall = renderer.On("Render", mock.Anything, mock.Anything, mock.Anything).Return(tc.rendererOut, tc.rendererErr)
+			}
+
+			res, err := svc.Bootstrap(context.Background(), tc.cfg.ExternalKey, tc.cfg.ExternalID, false)
+			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.err, err))
+			if tc.err == nil {
+				assert.Equal(t, tc.rendered, res.Content, fmt.Sprintf("%s: expected rendered content %q got %q\n", tc.desc, tc.rendered, res.Content))
+			}
+
+			repoCall.Unset()
+			if prCall != nil {
+				prCall.Unset()
+			}
+			if bsCall != nil {
+				bsCall.Unset()
+			}
+			if rndCall != nil {
+				rndCall.Unset()
+			}
+		})
+	}
+}
+
+func TestEnableConfig(t *testing.T) {
 	svc := newService()
 
 	c := config
+	activeConfig := config
+	activeConfig.Status = bootstrap.Active
+	inactiveConfig := config
+	inactiveConfig.Status = bootstrap.Inactive
+
 	cases := []struct {
-		desc          string
-		state         bootstrap.State
-		id            string
-		token         string
-		session       smqauthn.Session
-		userID        string
-		domainID      string
-		retrieveErr   error
-		connectErr    errors.SDKError
-		disconenctErr error
-		stateErr      error
-		err           error
+		desc        string
+		config      bootstrap.Config
+		id          string
+		session     smqauthn.Session
+		userID      string
+		domainID    string
+		retrieveErr error
+		statusErr   error
+		err         error
 	}{
 		{
-			desc:        "change state of non-existing config",
-			state:       bootstrap.Active,
+			desc:        "enable non-existing config",
+			config:      c,
 			id:          unknown,
-			token:       validToken,
 			userID:      validID,
 			domainID:    domainID,
 			retrieveErr: svcerr.ErrNotFound,
 			err:         svcerr.ErrNotFound,
 		},
 		{
-			desc:     "change state to Active",
-			state:    bootstrap.Active,
-			id:       c.ClientID,
-			token:    validToken,
+			desc:     "enable inactive config",
+			config:   inactiveConfig,
+			id:       c.ID,
 			userID:   validID,
 			domainID: domainID,
 			err:      nil,
 		},
 		{
-			desc:     "change state to current state",
-			state:    bootstrap.Active,
-			id:       c.ClientID,
-			token:    validToken,
+			desc:     "enable already active config",
+			config:   activeConfig,
+			id:       c.ID,
 			userID:   validID,
 			domainID: domainID,
 			err:      nil,
 		},
 		{
-			desc:     "change state to Inactive",
-			state:    bootstrap.Inactive,
-			id:       c.ClientID,
-			token:    validToken,
-			userID:   validID,
-			domainID: domainID,
-			err:      nil,
-		},
-		{
-			desc:       "change state with failed Connect",
-			state:      bootstrap.Active,
-			id:         c.ClientID,
-			token:      validToken,
-			userID:     validID,
-			domainID:   domainID,
-			connectErr: errors.NewSDKError(bootstrap.ErrClients),
-			err:        bootstrap.ErrClients,
-		},
-		{
-			desc:     "change state with invalid state",
-			state:    bootstrap.State(2),
-			id:       c.ClientID,
-			token:    validToken,
-			userID:   validID,
-			domainID: domainID,
-			stateErr: svcerr.ErrMalformedEntity,
-			err:      svcerr.ErrMalformedEntity,
+			desc:      "enable with repo error",
+			config:    inactiveConfig,
+			id:        c.ID,
+			userID:    validID,
+			domainID:  domainID,
+			statusErr: svcerr.ErrUpdateEntity,
+			err:       svcerr.ErrUpdateEntity,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
 			tc.session = smqauthn.Session{UserID: tc.userID, DomainID: tc.domainID, DomainUserID: validID}
-			repoCall := boot.On("RetrieveByID", context.Background(), tc.domainID, tc.id).Return(c, tc.retrieveErr)
-			sdkCall := sdk.On("ConnectClients", mock.Anything, mock.Anything, mock.Anything, []string{"Publish", "Subscribe"}, mock.Anything, tc.token).Return(tc.connectErr)
-			repoCall1 := boot.On("ChangeState", context.Background(), mock.Anything, mock.Anything, mock.Anything).Return(tc.stateErr)
-			err := svc.ChangeState(context.Background(), tc.session, tc.token, tc.id, tc.state)
+			repoCall := boot.On("RetrieveByID", context.Background(), tc.domainID, tc.id).Return(tc.config, tc.retrieveErr)
+			repoCall1 := boot.On("ChangeStatus", context.Background(), mock.Anything, mock.Anything, mock.Anything).Return(tc.statusErr)
+			_, err := svc.EnableConfig(context.Background(), tc.session, tc.id)
 			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			sdkCall.Unset()
 			repoCall.Unset()
 			repoCall1.Unset()
 		})
 	}
 }
 
-func TestUpdateChannelHandler(t *testing.T) {
+func TestDisableConfig(t *testing.T) {
 	svc := newService()
 
-	ch := bootstrap.Channel{
-		ID:       channel.ID,
-		Name:     "new name",
-		Metadata: map[string]any{"meta": "new"},
+	c := config
+	activeConfig := config
+	activeConfig.Status = bootstrap.Active
+	inactiveConfig := config
+	inactiveConfig.Status = bootstrap.Inactive
+
+	cases := []struct {
+		desc        string
+		config      bootstrap.Config
+		id          string
+		session     smqauthn.Session
+		userID      string
+		domainID    string
+		retrieveErr error
+		statusErr   error
+		err         error
+	}{
+		{
+			desc:        "disable non-existing config",
+			config:      c,
+			id:          unknown,
+			userID:      validID,
+			domainID:    domainID,
+			retrieveErr: svcerr.ErrNotFound,
+			err:         svcerr.ErrNotFound,
+		},
+		{
+			desc:     "disable active config",
+			config:   activeConfig,
+			id:       c.ID,
+			userID:   validID,
+			domainID: domainID,
+			err:      nil,
+		},
+		{
+			desc:     "disable already inactive config",
+			config:   inactiveConfig,
+			id:       c.ID,
+			userID:   validID,
+			domainID: domainID,
+			err:      nil,
+		},
+		{
+			desc:      "disable with repo error",
+			config:    activeConfig,
+			id:        c.ID,
+			userID:    validID,
+			domainID:  domainID,
+			statusErr: svcerr.ErrUpdateEntity,
+			err:       svcerr.ErrUpdateEntity,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			tc.session = smqauthn.Session{UserID: tc.userID, DomainID: tc.domainID, DomainUserID: validID}
+			repoCall := boot.On("RetrieveByID", context.Background(), tc.domainID, tc.id).Return(tc.config, tc.retrieveErr)
+			repoCall1 := boot.On("ChangeStatus", context.Background(), mock.Anything, mock.Anything, mock.Anything).Return(tc.statusErr)
+			_, err := svc.DisableConfig(context.Background(), tc.session, tc.id)
+			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
+			repoCall.Unset()
+			repoCall1.Unset()
+		})
+	}
+}
+
+func TestAssignProfile(t *testing.T) {
+	profile := bootstrap.Profile{
+		ID:             testsutil.GenerateUUID(t),
+		DomainID:       domainID,
+		Name:           "gateway-profile",
+		TemplateFormat: bootstrap.TemplateFormatGoTemplate,
+		Version:        1,
+	}
+
+	cases := []struct {
+		desc         string
+		configID     string
+		profileID    string
+		retrieveErr  error
+		assignErr    error
+		expectedErr  error
+		expectAssign bool
+	}{
+		{
+			desc:         "assign profile to enrollment",
+			configID:     config.ID,
+			profileID:    profile.ID,
+			expectAssign: true,
+		},
+		{
+			desc:        "assign profile with missing profile",
+			configID:    config.ID,
+			profileID:   profile.ID,
+			retrieveErr: svcerr.ErrNotFound,
+			expectedErr: svcerr.ErrNotFound,
+		},
+		{
+			desc:         "assign profile with repository error",
+			configID:     config.ID,
+			profileID:    profile.ID,
+			assignErr:    svcerr.ErrUpdateEntity,
+			expectedErr:  svcerr.ErrUpdateEntity,
+			expectAssign: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			svc := newService()
+			session := smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID}
+
+			prCall := profileRepo.On("RetrieveByID", context.Background(), domainID, tc.profileID).Return(profile, tc.retrieveErr)
+
+			var assignCall *mock.Call
+			if tc.expectAssign {
+				assignCall = boot.On("AssignProfile", context.Background(), domainID, tc.configID, tc.profileID).Return(tc.assignErr)
+			}
+
+			err := svc.AssignProfile(context.Background(), session, tc.configID, tc.profileID)
+			assert.True(t, errors.Contains(err, tc.expectedErr), fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.expectedErr, err))
+
+			prCall.Unset()
+			if assignCall != nil {
+				assignCall.Unset()
+			}
+		})
+	}
+}
+
+func TestCreateProfile(t *testing.T) {
+	session := smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID}
+
+	validProfile := bootstrap.Profile{
+		Name:           "test-profile",
+		TemplateFormat: bootstrap.TemplateFormatGoTemplate,
 	}
 
 	cases := []struct {
 		desc    string
-		channel bootstrap.Channel
+		profile bootstrap.Profile
+		saveErr error
 		err     error
 	}{
 		{
-			desc:    "update an existing channel",
-			channel: ch,
-			err:     nil,
+			desc:    "create profile successfully",
+			profile: validProfile,
 		},
 		{
-			desc:    "update a non-existing channel",
-			channel: bootstrap.Channel{ID: ""},
-			err:     nil,
+			desc:    "create profile defaults to go-template format",
+			profile: bootstrap.Profile{Name: "no-format"},
+		},
+		{
+			desc: "create profile with invalid slot: empty name",
+			profile: bootstrap.Profile{
+				Name:         "test",
+				BindingSlots: []bootstrap.BindingSlot{{Name: "", Type: "client"}},
+			},
+			err: errors.New("invalid binding slot: slot name is required"),
+		},
+		{
+			desc: "create profile with invalid slot: empty type",
+			profile: bootstrap.Profile{
+				Name:         "test",
+				BindingSlots: []bootstrap.BindingSlot{{Name: "mqtt", Type: ""}},
+			},
+			err: errors.New("invalid binding slot: slot \"mqtt\" type is required"),
+		},
+		{
+			desc: "create profile with duplicate slot names",
+			profile: bootstrap.Profile{
+				Name: "test",
+				BindingSlots: []bootstrap.BindingSlot{
+					{Name: "mqtt", Type: "client"},
+					{Name: "mqtt", Type: "channel"},
+				},
+			},
+			err: errors.New("invalid binding slot: duplicate slot \"mqtt\""),
+		},
+		{
+			desc: "create profile with invalid template syntax",
+			profile: bootstrap.Profile{
+				Name:            "test",
+				ContentTemplate: `{{ index .Vars \"mqtt_url\" }}`,
+			},
+			err: bootstrap.ErrRenderFailed,
+		},
+		{
+			desc:    "create profile with repository save error",
+			profile: validProfile,
+			saveErr: svcerr.ErrCreateEntity,
+			err:     svcerr.ErrCreateEntity,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
-			repoCall := boot.On("UpdateChannel", context.Background(), mock.Anything).Return(tc.err)
-			err := svc.UpdateChannelHandler(context.Background(), tc.channel)
-			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			repoCall.Unset()
+			svc := newService()
+			saveCall := profileRepo.EXPECT().Save(mock.Anything, mock.Anything).RunAndReturn(
+				func(_ context.Context, p bootstrap.Profile) (bootstrap.Profile, error) {
+					return p, tc.saveErr
+				})
+			saved, err := svc.CreateProfile(context.Background(), session, tc.profile)
+			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.err, err))
+			if tc.err == nil {
+				assert.NotEmpty(t, saved.ID, fmt.Sprintf("%s: expected non-empty profile ID\n", tc.desc))
+				assert.Equal(t, domainID, saved.DomainID, fmt.Sprintf("%s: expected domain ID %s got %s\n", tc.desc, domainID, saved.DomainID))
+				assert.Equal(t, bootstrap.TemplateFormatGoTemplate, saved.TemplateFormat, fmt.Sprintf("%s: expected go-template format\n", tc.desc))
+				assert.Equal(t, 1, saved.Version, fmt.Sprintf("%s: expected version 1\n", tc.desc))
+			}
+			saveCall.Unset()
 		})
 	}
 }
 
-func TestRemoveChannelHandler(t *testing.T) {
-	svc := newService()
+func TestViewProfile(t *testing.T) {
+	session := smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID}
+
+	profile := bootstrap.Profile{
+		ID:             testsutil.GenerateUUID(t),
+		DomainID:       domainID,
+		Name:           "view-profile",
+		TemplateFormat: bootstrap.TemplateFormatGoTemplate,
+		Version:        1,
+	}
 
 	cases := []struct {
-		desc string
-		id   string
-		err  error
+		desc        string
+		profileID   string
+		retrieveErr error
+		err         error
 	}{
 		{
-			desc: "remove an existing channel",
-			id:   config.Channels[0].ID,
-			err:  nil,
+			desc:      "view profile successfully",
+			profileID: profile.ID,
 		},
 		{
-			desc: "remove a non-existing channel",
-			id:   "unknown",
-			err:  nil,
+			desc:        "view non-existing profile",
+			profileID:   unknown,
+			retrieveErr: svcerr.ErrNotFound,
+			err:         svcerr.ErrNotFound,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
-			repoCall := boot.On("RemoveChannel", context.Background(), mock.Anything).Return(tc.err)
-			err := svc.RemoveChannelHandler(context.Background(), tc.id)
-			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			repoCall.Unset()
+			svc := newService()
+			prCall := profileRepo.On("RetrieveByID", context.Background(), domainID, tc.profileID).Return(profile, tc.retrieveErr)
+			got, err := svc.ViewProfile(context.Background(), session, tc.profileID)
+			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.err, err))
+			if tc.err == nil {
+				assert.Equal(t, profile, got, fmt.Sprintf("%s: expected profile %v got %v\n", tc.desc, profile, got))
+			}
+			prCall.Unset()
 		})
 	}
 }
 
-func TestRemoveConfigHandler(t *testing.T) {
-	svc := newService()
+func TestUpdateProfile(t *testing.T) {
+	session := smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID}
 
-	cases := []struct {
-		desc string
-		id   string
-		err  error
-	}{
-		{
-			desc: "remove an existing config",
-			id:   config.ClientID,
-			err:  nil,
-		},
-		{
-			desc: "remove a non-existing channel",
-			id:   "unknown",
-			err:  nil,
-		},
+	validProfile := bootstrap.Profile{
+		ID:             testsutil.GenerateUUID(t),
+		DomainID:       domainID,
+		Name:           "updated-profile",
+		TemplateFormat: bootstrap.TemplateFormatGoTemplate,
 	}
-
-	for _, tc := range cases {
-		t.Run(tc.desc, func(t *testing.T) {
-			repoCall := boot.On("RemoveClient", context.Background(), mock.Anything).Return(tc.err)
-			err := svc.RemoveConfigHandler(context.Background(), tc.id)
-			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			repoCall.Unset()
-		})
-	}
-}
-
-func TestConnectClientHandler(t *testing.T) {
-	svc := newService()
 
 	cases := []struct {
 		desc      string
-		clientID  string
-		channelID string
+		profile   bootstrap.Profile
+		updateErr error
 		err       error
 	}{
 		{
-			desc:      "connect",
-			channelID: channel.ID,
-			clientID:  config.ClientID,
-			err:       nil,
+			desc:    "update profile successfully",
+			profile: validProfile,
 		},
 		{
-			desc:      "connect connected",
-			channelID: channel.ID,
-			clientID:  config.ClientID,
-			err:       svcerr.ErrAddPolicies,
+			desc:    "update profile defaults to go-template format",
+			profile: bootstrap.Profile{ID: validProfile.ID, Name: "no-format"},
+		},
+		{
+			desc: "update profile with invalid slot: empty type",
+			profile: bootstrap.Profile{
+				ID:           validProfile.ID,
+				Name:         "test",
+				BindingSlots: []bootstrap.BindingSlot{{Name: "mqtt", Type: ""}},
+			},
+			err: errors.New("invalid binding slot: slot \"mqtt\" type is required"),
+		},
+		{
+			desc: "update profile with duplicate slot names",
+			profile: bootstrap.Profile{
+				ID:   validProfile.ID,
+				Name: "test",
+				BindingSlots: []bootstrap.BindingSlot{
+					{Name: "slot1", Type: "client"},
+					{Name: "slot1", Type: "channel"},
+				},
+			},
+			err: errors.New("invalid binding slot: duplicate slot \"slot1\""),
+		},
+		{
+			desc: "update profile with invalid template syntax",
+			profile: bootstrap.Profile{
+				ID:              validProfile.ID,
+				Name:            "test",
+				ContentTemplate: `{{ index .Vars \"mqtt_url\" }}`,
+			},
+			err: bootstrap.ErrRenderFailed,
+		},
+		{
+			desc:      "update profile with repository error",
+			profile:   validProfile,
+			updateErr: svcerr.ErrUpdateEntity,
+			err:       svcerr.ErrUpdateEntity,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
-			repoCall := boot.On("ConnectClient", context.Background(), mock.Anything, mock.Anything).Return(tc.err)
-			err := svc.ConnectClientHandler(context.Background(), tc.channelID, tc.clientID)
-			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			repoCall.Unset()
+			svc := newService()
+			updateCall := profileRepo.On("Update", context.Background(), mock.Anything).Return(tc.updateErr)
+			err := svc.UpdateProfile(context.Background(), session, tc.profile)
+			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.err, err))
+			updateCall.Unset()
 		})
 	}
 }
 
-func TestDisconnectClientsHandler(t *testing.T) {
-	svc := newService()
+func TestListProfiles(t *testing.T) {
+	session := smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID}
+
+	profiles := []bootstrap.Profile{
+		{ID: testsutil.GenerateUUID(t), DomainID: domainID, Name: "p1", TemplateFormat: bootstrap.TemplateFormatGoTemplate, Version: 1},
+		{ID: testsutil.GenerateUUID(t), DomainID: domainID, Name: "p2", TemplateFormat: bootstrap.TemplateFormatGoTemplate, Version: 1},
+	}
+	page := bootstrap.ProfilesPage{Total: 2, Offset: 0, Limit: 10, Profiles: profiles}
 
 	cases := []struct {
-		desc      string
-		clientID  string
-		channelID string
-		err       error
+		desc    string
+		offset  uint64
+		limit   uint64
+		page    bootstrap.ProfilesPage
+		listErr error
+		err     error
 	}{
 		{
-			desc:      "disconnect",
-			channelID: channel.ID,
-			clientID:  config.ClientID,
-			err:       nil,
+			desc:  "list profiles successfully",
+			limit: 10,
+			page:  page,
 		},
 		{
-			desc:      "disconnect disconnected",
-			channelID: channel.ID,
-			clientID:  config.ClientID,
-			err:       nil,
+			desc:    "list profiles with repository error",
+			limit:   10,
+			listErr: svcerr.ErrViewEntity,
+			err:     svcerr.ErrViewEntity,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
-			repoCall := boot.On("DisconnectClient", context.Background(), mock.Anything, mock.Anything).Return(tc.err)
-			err := svc.DisconnectClientHandler(context.Background(), tc.channelID, tc.clientID)
-			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-			repoCall.Unset()
+			svc := newService()
+			listCall := profileRepo.On("RetrieveAll", context.Background(), domainID, tc.offset, tc.limit).Return(tc.page, tc.listErr)
+			got, err := svc.ListProfiles(context.Background(), session, tc.offset, tc.limit)
+			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.err, err))
+			if tc.err == nil {
+				assert.Equal(t, tc.page, got, fmt.Sprintf("%s: expected page %v got %v\n", tc.desc, tc.page, got))
+			}
+			listCall.Unset()
+		})
+	}
+}
+
+func TestDeleteProfile(t *testing.T) {
+	session := smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID}
+	profileID := testsutil.GenerateUUID(t)
+
+	cases := []struct {
+		desc      string
+		profileID string
+		deleteErr error
+		err       error
+	}{
+		{
+			desc:      "delete profile successfully",
+			profileID: profileID,
+		},
+		{
+			desc:      "delete profile with repository error",
+			profileID: profileID,
+			deleteErr: svcerr.ErrRemoveEntity,
+			err:       svcerr.ErrRemoveEntity,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			svc := newService()
+			deleteCall := profileRepo.On("Delete", context.Background(), domainID, tc.profileID).Return(tc.deleteErr)
+			err := svc.DeleteProfile(context.Background(), session, tc.profileID)
+			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.err, err))
+			deleteCall.Unset()
+		})
+	}
+}
+
+func TestBindResources(t *testing.T) {
+	session := smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID}
+
+	profile := bootstrap.Profile{
+		ID:       testsutil.GenerateUUID(t),
+		DomainID: domainID,
+		Name:     "bind-profile",
+		BindingSlots: []bootstrap.BindingSlot{
+			{Name: "mqtt", Type: "client", Required: true},
+		},
+	}
+
+	channelProfile := bootstrap.Profile{
+		ID:       testsutil.GenerateUUID(t),
+		DomainID: domainID,
+		Name:     "channel-profile",
+		BindingSlots: []bootstrap.BindingSlot{
+			{Name: "data", Type: "channel", Required: true},
+		},
+	}
+
+	cfg := bootstrap.Config{
+		ID:        config.ID,
+		DomainID:  domainID,
+		ProfileID: profile.ID,
+	}
+
+	channelCfg := bootstrap.Config{
+		ID:        config.ID,
+		DomainID:  domainID,
+		ProfileID: channelProfile.ID,
+	}
+
+	snapshot := bootstrap.BindingSnapshot{
+		ConfigID:   config.ID,
+		Slot:       "mqtt",
+		Type:       "client",
+		ResourceID: validID,
+		Snapshot:   map[string]any{"id": validID},
+	}
+
+	channelSnapshot := bootstrap.BindingSnapshot{
+		ConfigID:   config.ID,
+		Slot:       "data",
+		Type:       "channel",
+		ResourceID: validID,
+		Snapshot:   map[string]any{"id": validID},
+	}
+
+	requested := []bootstrap.BindingRequest{
+		{Slot: "mqtt", Type: "client", ResourceID: validID},
+	}
+
+	channelRequested := []bootstrap.BindingRequest{
+		{Slot: "data", Type: "channel", ResourceID: validID},
+	}
+
+	cases := []struct {
+		desc        string
+		configID    string
+		bindings    []bootstrap.BindingRequest
+		cfgErr      error
+		prErr       error
+		resolveErr  error
+		retrieveErr error
+		saveErr     error
+		snapshots   []bootstrap.BindingSnapshot
+		useChannel  bool
+		err         error
+	}{
+		{
+			desc:     "bind resources with config not found",
+			configID: config.ID,
+			bindings: requested,
+			cfgErr:   svcerr.ErrNotFound,
+			err:      svcerr.ErrNotFound,
+		},
+		{
+			desc:     "bind resources with profile not found",
+			configID: config.ID,
+			bindings: requested,
+			prErr:    svcerr.ErrNotFound,
+			err:      svcerr.ErrNotFound,
+		},
+		{
+			desc:     "bind resources with unknown slot",
+			configID: config.ID,
+			bindings: []bootstrap.BindingRequest{{Slot: "unknown", Type: "client", ResourceID: validID}},
+			err:      errors.New("invalid binding slot: unknown slot \"unknown\""),
+		},
+		{
+			desc:     "bind resources with wrong slot type",
+			configID: config.ID,
+			bindings: []bootstrap.BindingRequest{{Slot: "mqtt", Type: "channel", ResourceID: validID}},
+			err:      errors.New("invalid binding slot: slot \"mqtt\" expects \"client\", got \"channel\""),
+		},
+		{
+			desc:       "bind resources with resolver error",
+			configID:   config.ID,
+			bindings:   requested,
+			resolveErr: errors.New("resolve failed"),
+			err:        errors.New("resolve failed"),
+		},
+		{
+			desc:        "bind resources with binding store retrieve error",
+			configID:    config.ID,
+			bindings:    requested,
+			snapshots:   []bootstrap.BindingSnapshot{snapshot},
+			retrieveErr: svcerr.ErrViewEntity,
+			err:         svcerr.ErrViewEntity,
+		},
+		{
+			desc:     "bind resources with required slot not satisfied",
+			configID: config.ID,
+			bindings: requested,
+			snapshots: []bootstrap.BindingSnapshot{
+				{ConfigID: config.ID, Slot: "mqtt", Type: "channel", ResourceID: validID},
+			},
+			err: errors.New("invalid binding slot: slot \"mqtt\" expects \"client\", got \"channel\""),
+		},
+		{
+			desc:      "bind resources with save error",
+			configID:  config.ID,
+			bindings:  requested,
+			snapshots: []bootstrap.BindingSnapshot{snapshot},
+			saveErr:   svcerr.ErrCreateEntity,
+			err:       svcerr.ErrCreateEntity,
+		},
+		{
+			desc:      "bind resources successfully",
+			configID:  config.ID,
+			bindings:  requested,
+			snapshots: []bootstrap.BindingSnapshot{snapshot},
+		},
+		{
+			desc:       "bind channel resource successfully",
+			configID:   config.ID,
+			bindings:   channelRequested,
+			snapshots:  []bootstrap.BindingSnapshot{channelSnapshot},
+			useChannel: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			svc := newService()
+			activeCfg, activeProfile := cfg, profile
+			if tc.useChannel {
+				activeCfg = channelCfg
+				activeProfile = channelProfile
+			}
+			boot.On("RetrieveByID", context.Background(), domainID, tc.configID).Return(activeCfg, tc.cfgErr)
+			profileRepo.On("RetrieveByID", context.Background(), domainID, activeProfile.ID).Return(activeProfile, tc.prErr)
+			resolver.On("Resolve", context.Background(), mock.Anything).Return(tc.snapshots, tc.resolveErr)
+			bindingStore.On("Retrieve", context.Background(), tc.configID).Return([]bootstrap.BindingSnapshot{}, tc.retrieveErr)
+			bindingStore.On("Save", context.Background(), tc.configID, mock.Anything).Return(tc.saveErr)
+
+			err := svc.BindResources(context.Background(), session, validToken, tc.configID, tc.bindings)
+			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.err, err))
+		})
+	}
+}
+
+func TestListBindings(t *testing.T) {
+	session := smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID}
+
+	snapshots := []bootstrap.BindingSnapshot{
+		{ConfigID: config.ID, Slot: "mqtt", Type: "client", ResourceID: validID, Snapshot: map[string]any{"id": validID}},
+	}
+
+	cases := []struct {
+		desc        string
+		configID    string
+		cfgErr      error
+		bindings    []bootstrap.BindingSnapshot
+		retrieveErr error
+		err         error
+	}{
+		{
+			desc:     "list bindings with config not found",
+			configID: config.ID,
+			cfgErr:   svcerr.ErrNotFound,
+			err:      svcerr.ErrNotFound,
+		},
+		{
+			desc:        "list bindings with retrieve error",
+			configID:    config.ID,
+			retrieveErr: svcerr.ErrViewEntity,
+			err:         svcerr.ErrViewEntity,
+		},
+		{
+			desc:     "list bindings successfully",
+			configID: config.ID,
+			bindings: snapshots,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			svc := newService()
+			boot.On("RetrieveByID", context.Background(), domainID, tc.configID).Return(config, tc.cfgErr)
+			bindingStore.On("Retrieve", context.Background(), tc.configID).Return(tc.bindings, tc.retrieveErr)
+
+			got, err := svc.ListBindings(context.Background(), session, tc.configID)
+			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.err, err))
+			if tc.err == nil {
+				assert.Len(t, got, len(tc.bindings), fmt.Sprintf("%s: expected %d bindings got %d\n", tc.desc, len(tc.bindings), len(got)))
+			}
+		})
+	}
+}
+
+func TestRefreshBindings(t *testing.T) {
+	session := smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID}
+
+	profile := bootstrap.Profile{
+		ID:       testsutil.GenerateUUID(t),
+		DomainID: domainID,
+		Name:     "refresh-profile",
+		BindingSlots: []bootstrap.BindingSlot{
+			{Name: "mqtt", Type: "client", Required: true},
+		},
+	}
+
+	cfg := bootstrap.Config{
+		ID:        config.ID,
+		DomainID:  domainID,
+		ProfileID: profile.ID,
+	}
+
+	existing := []bootstrap.BindingSnapshot{
+		{ConfigID: config.ID, Slot: "mqtt", Type: "client", ResourceID: validID},
+	}
+
+	refreshed := []bootstrap.BindingSnapshot{
+		{ConfigID: config.ID, Slot: "mqtt", Type: "client", ResourceID: validID, Snapshot: map[string]any{"id": validID}},
+	}
+
+	cases := []struct {
+		desc        string
+		configID    string
+		cfgErr      error
+		prErr       error
+		existing    []bootstrap.BindingSnapshot
+		retrieveErr error
+		snapshots   []bootstrap.BindingSnapshot
+		resolveErr  error
+		saveErr     error
+		err         error
+	}{
+		{
+			desc:     "refresh bindings with config not found",
+			configID: config.ID,
+			cfgErr:   svcerr.ErrNotFound,
+			err:      svcerr.ErrNotFound,
+		},
+		{
+			desc:     "refresh bindings with profile not found",
+			configID: config.ID,
+			prErr:    svcerr.ErrNotFound,
+			err:      svcerr.ErrNotFound,
+		},
+		{
+			desc:        "refresh bindings with retrieve error",
+			configID:    config.ID,
+			retrieveErr: svcerr.ErrViewEntity,
+			err:         svcerr.ErrViewEntity,
+		},
+		{
+			desc:     "refresh bindings with no existing bindings is a no-op",
+			configID: config.ID,
+		},
+		{
+			desc:       "refresh bindings with resolver error",
+			configID:   config.ID,
+			existing:   existing,
+			resolveErr: errors.New("resolve failed"),
+			err:        errors.New("resolve failed"),
+		},
+		{
+			desc:     "refresh bindings with required binding missing after refresh",
+			configID: config.ID,
+			existing: existing,
+			snapshots: []bootstrap.BindingSnapshot{
+				{ConfigID: config.ID, Slot: "mqtt", Type: "channel", ResourceID: validID},
+			},
+			err: errors.New("invalid binding slot: slot \"mqtt\" expects \"client\", got \"channel\""),
+		},
+		{
+			desc:      "refresh bindings with save error",
+			configID:  config.ID,
+			existing:  existing,
+			snapshots: refreshed,
+			saveErr:   svcerr.ErrCreateEntity,
+			err:       svcerr.ErrCreateEntity,
+		},
+		{
+			desc:      "refresh bindings successfully",
+			configID:  config.ID,
+			existing:  existing,
+			snapshots: refreshed,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			svc := newService()
+			boot.On("RetrieveByID", context.Background(), domainID, tc.configID).Return(cfg, tc.cfgErr)
+			profileRepo.On("RetrieveByID", context.Background(), domainID, profile.ID).Return(profile, tc.prErr)
+			bindingStore.On("Retrieve", context.Background(), tc.configID).Return(tc.existing, tc.retrieveErr)
+			resolver.On("Resolve", context.Background(), mock.Anything).Return(tc.snapshots, tc.resolveErr)
+			bindingStore.On("Save", context.Background(), tc.configID, mock.Anything).Return(tc.saveErr)
+
+			err := svc.RefreshBindings(context.Background(), session, validToken, tc.configID)
+			assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %v got %v\n", tc.desc, tc.err, err))
 		})
 	}
 }

@@ -13,15 +13,13 @@ import (
 
 	"github.com/absmach/magistrala/bootstrap"
 	"github.com/absmach/magistrala/bootstrap/events/producer"
+	bootstraphasher "github.com/absmach/magistrala/bootstrap/hasher"
 	"github.com/absmach/magistrala/bootstrap/mocks"
 	"github.com/absmach/magistrala/internal/testsutil"
 	smqauthn "github.com/absmach/magistrala/pkg/authn"
 	"github.com/absmach/magistrala/pkg/errors"
 	svcerr "github.com/absmach/magistrala/pkg/errors/service"
 	"github.com/absmach/magistrala/pkg/events/store"
-	policysvc "github.com/absmach/magistrala/pkg/policies"
-	policymocks "github.com/absmach/magistrala/pkg/policies/mocks"
-	mgsdk "github.com/absmach/magistrala/pkg/sdk"
 	sdkmocks "github.com/absmach/magistrala/pkg/sdk/mocks"
 	"github.com/absmach/magistrala/pkg/uuid"
 	"github.com/redis/go-redis/v9"
@@ -31,35 +29,22 @@ import (
 )
 
 const (
-	streamID        = "magistrala.bootstrap"
-	email           = "user@example.com"
-	validToken      = "validToken"
-	invalidToken    = "invalid"
-	unknownClientID = "unknown"
-	channelsNum     = 3
-	defaultTimout   = 5
+	streamID   = "magistrala.bootstrap"
+	validToken = "validToken"
+	unknownID  = "unknown"
 
-	configPrefix        = "config."
-	configCreate        = configPrefix + "create"
-	configView          = configPrefix + "view"
-	configUpdate        = configPrefix + "update"
-	configRemove        = configPrefix + "remove"
-	configList          = configPrefix + "list"
-	configHandlerRemove = configPrefix + "remove_handler"
-
-	clientPrefix            = "client."
-	clientBootstrap         = clientPrefix + "bootstrap"
-	clientStateChange       = clientPrefix + "change_state"
-	clientUpdateConnections = clientPrefix + "update_connections"
-	clientConnect           = clientPrefix + "connect"
-	clientDisconnect        = clientPrefix + "disconnect"
-
-	channelPrefix        = "group."
-	channelHandlerRemove = channelPrefix + "remove_handler"
-	channelUpdateHandler = channelPrefix + "update_handler"
+	configPrefix    = "config."
+	configCreate    = configPrefix + "create"
+	configView      = configPrefix + "view"
+	configUpdate    = configPrefix + "update"
+	configRemove    = configPrefix + "remove"
+	configList      = configPrefix + "list"
+	clientPrefix    = "client."
+	clientBootstrap = clientPrefix + "bootstrap"
+	configEnable    = configPrefix + "enable"
+	configDisable   = configPrefix + "disable"
 
 	certUpdate = "cert.update"
-	instanceID = "5de9b29a-feb9-11ed-be56-0242ac120002"
 )
 
 var (
@@ -68,43 +53,33 @@ var (
 	domainID = testsutil.GenerateUUID(&testing.T{})
 	validID  = testsutil.GenerateUUID(&testing.T{})
 
-	channel = bootstrap.Channel{
-		ID:       testsutil.GenerateUUID(&testing.T{}),
-		Name:     "name",
-		Metadata: map[string]any{"name": "value"},
-	}
-
 	config = bootstrap.Config{
-		ClientID:     testsutil.GenerateUUID(&testing.T{}),
-		ClientSecret: testsutil.GenerateUUID(&testing.T{}),
-		ExternalID:   testsutil.GenerateUUID(&testing.T{}),
-		ExternalKey:  testsutil.GenerateUUID(&testing.T{}),
-		Channels:     []bootstrap.Channel{channel},
-		Content:      "config",
+		ID:          testsutil.GenerateUUID(&testing.T{}),
+		ExternalID:  testsutil.GenerateUUID(&testing.T{}),
+		ExternalKey: testsutil.GenerateUUID(&testing.T{}),
+		Content:     "config",
+		Status:      bootstrap.EnabledStatus,
 	}
 )
 
 type testVariable struct {
-	svc      bootstrap.Service
-	boot     *mocks.ConfigRepository
-	policies *policymocks.Service
-	sdk      *sdkmocks.SDK
+	svc  bootstrap.Service
+	boot *mocks.ConfigRepository
+	sdk  *sdkmocks.SDK
 }
 
 func newTestVariable(t *testing.T, redisURL string) testVariable {
 	boot := new(mocks.ConfigRepository)
-	policies := new(policymocks.Service)
 	sdk := new(sdkmocks.SDK)
 	idp := uuid.NewMock()
-	svc := bootstrap.New(policies, boot, sdk, encKey, idp)
+	svc := bootstrap.New(boot, nil, nil, nil, nil, sdk, bootstraphasher.New(), encKey, idp)
 	publisher, err := store.NewPublisher(context.Background(), redisURL, "bootstrap-es-pub-test")
 	require.Nil(t, err, fmt.Sprintf("got unexpected error: %s", err))
 	svc = producer.NewEventStoreMiddleware(svc, publisher)
 	return testVariable{
-		svc:      svc,
-		boot:     boot,
-		policies: policies,
-		sdk:      sdk,
+		svc:  svc,
+		boot: boot,
+		sdk:  sdk,
 	}
 }
 
@@ -114,28 +89,16 @@ func TestAdd(t *testing.T) {
 
 	tv := newTestVariable(t, redisURL)
 
-	var channels []string
-	for _, ch := range config.Channels {
-		channels = append(channels, ch.ID)
-	}
-
-	invalidConfig := config
-	invalidConfig.Channels = []bootstrap.Channel{{ID: "empty"}}
-	invalidConfig.Channels = []bootstrap.Channel{{ID: "empty"}}
-
 	cases := []struct {
-		desc      string
-		config    bootstrap.Config
-		token     string
-		session   smqauthn.Session
-		id        string
-		domainID  string
-		clientErr error
-		channel   []bootstrap.Channel
-		listErr   error
-		saveErr   error
-		err       error
-		event     map[string]any
+		desc     string
+		config   bootstrap.Config
+		token    string
+		session  smqauthn.Session
+		id       string
+		domainID string
+		saveErr  error
+		err      error
+		event    map[string]any
 	}{
 		{
 			desc:     "create config successfully",
@@ -143,12 +106,10 @@ func TestAdd(t *testing.T) {
 			token:    validToken,
 			id:       validID,
 			domainID: domainID,
-			channel:  config.Channels,
 			event: map[string]any{
-				"client_id":   "1",
+				"config_id":   "1",
 				"domain_id":   domainID,
 				"name":        config.Name,
-				"channels":    channels,
 				"external_id": config.ExternalID,
 				"content":     config.Content,
 				"timestamp":   time.Now().Unix(),
@@ -157,43 +118,21 @@ func TestAdd(t *testing.T) {
 			err: nil,
 		},
 		{
-			desc:      "create config with failed to fetch client",
-			config:    config,
-			token:     validToken,
-			id:        validID,
-			domainID:  domainID,
-			event:     nil,
-			clientErr: svcerr.ErrNotFound,
-			err:       svcerr.ErrNotFound,
-		},
-		{
-			desc:     "create config with failed to list existing",
+			desc:     "create config with failed to save",
 			config:   config,
 			token:    validToken,
 			id:       validID,
 			domainID: domainID,
 			event:    nil,
-			listErr:  svcerr.ErrNotFound,
-			err:      svcerr.ErrNotFound,
-		},
-		{
-			desc:     "create invalid config",
-			config:   invalidConfig,
-			token:    validToken,
-			id:       validID,
-			domainID: domainID,
-			event:    nil,
-			listErr:  svcerr.ErrMalformedEntity,
-			err:      svcerr.ErrMalformedEntity,
+			saveErr:  svcerr.ErrCreateEntity,
+			err:      svcerr.ErrCreateEntity,
 		},
 	}
 
 	lastID := "0"
 	for _, tc := range cases {
 		tc.session = smqauthn.Session{UserID: validID, DomainID: tc.domainID, DomainUserID: validID}
-		sdkCall := tv.sdk.On("Client", mock.Anything, tc.config.ClientID, tc.domainID, tc.token).Return(mgsdk.Client{ID: tc.config.ClientID, Credentials: mgsdk.ClientCredentials{Secret: tc.config.ClientSecret}}, errors.NewSDKError(tc.clientErr))
-		repoCall := tv.boot.On("ListExisting", context.Background(), domainID, mock.Anything).Return(tc.config.Channels, tc.listErr)
-		repoCall1 := tv.boot.On("Save", context.Background(), mock.Anything, mock.Anything).Return(mock.Anything, tc.saveErr)
+		repoCall := tv.boot.On("Save", context.Background(), mock.Anything).Return(mock.Anything, tc.saveErr)
 
 		_, err := tv.svc.Add(context.Background(), tc.session, tc.token, tc.config)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
@@ -212,9 +151,7 @@ func TestAdd(t *testing.T) {
 
 		test(t, tc.event, event, tc.desc)
 
-		sdkCall.Unset()
 		repoCall.Unset()
-		repoCall1.Unset()
 	}
 }
 
@@ -225,7 +162,7 @@ func TestView(t *testing.T) {
 	tv := newTestVariable(t, redisURL)
 
 	nonExisting := config
-	nonExisting.ClientID = unknownClientID
+	nonExisting.ID = unknownID
 
 	cases := []struct {
 		desc        string
@@ -246,10 +183,9 @@ func TestView(t *testing.T) {
 			domainID: domainID,
 			err:      nil,
 			event: map[string]any{
-				"client_id":   config.ClientID,
+				"config_id":   config.ID,
 				"domain_id":   config.DomainID,
 				"name":        config.Name,
-				"channels":    config.Channels,
 				"external_id": config.ExternalID,
 				"content":     config.Content,
 				"timestamp":   time.Now().Unix(),
@@ -271,8 +207,8 @@ func TestView(t *testing.T) {
 	lastID := "0"
 	for _, tc := range cases {
 		tc.session = smqauthn.Session{UserID: validID, DomainID: tc.domainID, DomainUserID: validID}
-		repoCall := tv.boot.On("RetrieveByID", context.Background(), tc.domainID, tc.config.ClientID).Return(config, tc.retrieveErr)
-		_, err := tv.svc.View(context.Background(), tc.session, tc.config.ClientID)
+		repoCall := tv.boot.On("RetrieveByID", context.Background(), tc.domainID, tc.config.ID).Return(config, tc.retrieveErr)
+		_, err := tv.svc.View(context.Background(), tc.session, tc.config.ID)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 
 		streams := redisClient.XRead(context.Background(), &redis.XReadArgs{
@@ -300,24 +236,12 @@ func TestUpdate(t *testing.T) {
 
 	tv := newTestVariable(t, redisURL)
 
-	c := config
-
-	ch1 := channel
-	ch1.ID = testsutil.GenerateUUID(t)
-
-	ch2 := channel
-	ch2.ID = testsutil.GenerateUUID(t)
-
-	c.Channels = append(c.Channels, ch1, ch2)
-
-	modified := c
+	modified := config
 	modified.Content = "new-config"
 	modified.Name = "new name"
 
 	nonExisting := config
-	nonExisting.ClientID = unknownClientID
-
-	channels := []string{modified.Channels[0].ID, modified.Channels[1].ID}
+	nonExisting.ID = unknownID
 
 	cases := []struct {
 		desc      string
@@ -342,11 +266,10 @@ func TestUpdate(t *testing.T) {
 				"content":     modified.Content,
 				"timestamp":   time.Now().UnixNano(),
 				"operation":   configUpdate,
-				"channels":    channels,
 				"external_id": modified.ExternalID,
-				"client_id":   modified.ClientID,
+				"config_id":   modified.ID,
 				"domain_id":   domainID,
-				"state":       "0",
+				"status":      bootstrap.Disabled,
 				"occurred_at": time.Now().UnixNano(),
 			},
 		},
@@ -388,119 +311,6 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
-func TestUpdateConnections(t *testing.T) {
-	err := redisClient.FlushAll(context.Background()).Err()
-	assert.Nil(t, err, fmt.Sprintf("got unexpected error: %s", err))
-
-	tv := newTestVariable(t, redisURL)
-
-	cases := []struct {
-		desc        string
-		configID    string
-		id          string
-		domainID    string
-		token       string
-		session     smqauthn.Session
-		connections []string
-		clientErr   error
-		channelErr  error
-		retrieveErr error
-		listErr     error
-		updateErr   error
-		err         error
-		event       map[string]any
-	}{
-		{
-			desc:        "update connections successfully",
-			configID:    config.ClientID,
-			token:       validToken,
-			id:          validID,
-			domainID:    domainID,
-			connections: []string{config.Channels[0].ID},
-			err:         nil,
-			event: map[string]any{
-				"client_id": config.ClientID,
-				"channels":  "2",
-				"timestamp": time.Now().Unix(),
-				"operation": clientUpdateConnections,
-			},
-		},
-		{
-			desc:        "update connections with failed channel fetch",
-			configID:    config.ClientID,
-			token:       validToken,
-			id:          validID,
-			domainID:    domainID,
-			connections: []string{"256"},
-			channelErr:  errors.NewSDKError(svcerr.ErrNotFound),
-			err:         svcerr.ErrNotFound,
-			event:       nil,
-		},
-		{
-			desc:        "update connections with failed RetrieveByID",
-			configID:    config.ClientID,
-			token:       validToken,
-			id:          validID,
-			domainID:    domainID,
-			connections: []string{config.Channels[0].ID},
-			retrieveErr: svcerr.ErrNotFound,
-			err:         svcerr.ErrNotFound,
-			event:       nil,
-		},
-		{
-			desc:        "update connections with failed ListExisting",
-			configID:    config.ClientID,
-			token:       validToken,
-			id:          validID,
-			domainID:    domainID,
-			connections: []string{config.Channels[0].ID},
-			listErr:     svcerr.ErrNotFound,
-			err:         svcerr.ErrNotFound,
-			event:       nil,
-		},
-		{
-			desc:        "update connections with failed UpdateConnections",
-			configID:    config.ClientID,
-			token:       validToken,
-			id:          validID,
-			domainID:    domainID,
-			connections: []string{config.Channels[0].ID},
-			updateErr:   svcerr.ErrUpdateEntity,
-			err:         svcerr.ErrUpdateEntity,
-			event:       nil,
-		},
-	}
-
-	lastID := "0"
-	for _, tc := range cases {
-		tc.session = smqauthn.Session{UserID: validID, DomainID: tc.domainID, DomainUserID: validID}
-		sdkCall := tv.sdk.On("Channel", mock.Anything, mock.Anything, tc.domainID, tc.token).Return(mgsdk.Channel{}, tc.channelErr)
-		repoCall := tv.boot.On("RetrieveByID", context.Background(), tc.domainID, tc.configID).Return(config, tc.retrieveErr)
-		repoCall1 := tv.boot.On("ListExisting", context.Background(), domainID, mock.Anything, mock.Anything).Return(config.Channels, tc.listErr)
-		repoCall2 := tv.boot.On("UpdateConnections", context.Background(), tc.domainID, tc.configID, mock.Anything, tc.connections).Return(tc.updateErr)
-		err := tv.svc.UpdateConnections(context.Background(), tc.session, tc.token, tc.configID, tc.connections)
-		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-
-		streams := redisClient.XRead(context.Background(), &redis.XReadArgs{
-			Streams: []string{streamID, lastID},
-			Count:   1,
-			Block:   time.Second,
-		}).Val()
-
-		var event map[string]any
-		if len(streams) > 0 && len(streams[0].Messages) > 0 {
-			event := streams[0].Messages
-			lastID = event[0].ID
-		}
-
-		test(t, tc.event, event, tc.desc)
-		sdkCall.Unset()
-		repoCall.Unset()
-		repoCall1.Unset()
-		repoCall2.Unset()
-	}
-}
-
 func TestUpdateCert(t *testing.T) {
 	err := redisClient.FlushAll(context.Background()).Err()
 	assert.Nil(t, err, fmt.Sprintf("got unexpected error: %s", err))
@@ -523,7 +333,7 @@ func TestUpdateCert(t *testing.T) {
 	}{
 		{
 			desc:       "update cert successfully",
-			configID:   config.ClientID,
+			configID:   config.ID,
 			userID:     validID,
 			domainID:   domainID,
 			token:      validToken,
@@ -532,11 +342,10 @@ func TestUpdateCert(t *testing.T) {
 			caCert:     "caCert",
 			err:        nil,
 			event: map[string]any{
-				"client_secret": config.ClientSecret,
-				"client_cert":   "clientCert",
-				"client_key":    "clientKey",
-				"ca_cert":       "caCert",
-				"operation":     certUpdate,
+				"client_cert": "clientCert",
+				"client_key":  "clientKey",
+				"ca_cert":     "caCert",
+				"operation":   certUpdate,
 			},
 		},
 		{
@@ -554,7 +363,7 @@ func TestUpdateCert(t *testing.T) {
 		},
 		{
 			desc:       "update cert with empty client certificate",
-			configID:   config.ClientID,
+			configID:   config.ID,
 			token:      validToken,
 			userID:     validID,
 			domainID:   domainID,
@@ -566,7 +375,7 @@ func TestUpdateCert(t *testing.T) {
 		},
 		{
 			desc:       "update cert with empty client key",
-			configID:   config.ClientID,
+			configID:   config.ID,
 			token:      validToken,
 			userID:     validID,
 			domainID:   domainID,
@@ -578,7 +387,7 @@ func TestUpdateCert(t *testing.T) {
 		},
 		{
 			desc:       "update cert with empty CA certificate",
-			configID:   config.ClientID,
+			configID:   config.ID,
 			token:      validToken,
 			userID:     validID,
 			domainID:   domainID,
@@ -587,25 +396,6 @@ func TestUpdateCert(t *testing.T) {
 			caCert:     "",
 			err:        nil,
 			event:      nil,
-		},
-		{
-			desc:       "successful update without CA certificate",
-			configID:   config.ClientID,
-			token:      validToken,
-			userID:     validID,
-			domainID:   domainID,
-			clientCert: "clientCert",
-			clientKey:  "clientKey",
-			caCert:     "",
-			err:        nil,
-			event: map[string]any{
-				"client_secret": config.ClientSecret,
-				"client_cert":   "clientCert",
-				"client_key":    "clientKey",
-				"ca_cert":       "caCert",
-				"operation":     certUpdate,
-				"timestamp":     time.Now().Unix(),
-			},
 		},
 	}
 
@@ -642,31 +432,29 @@ func TestList(t *testing.T) {
 	var c bootstrap.Config
 	saved := make([]bootstrap.Config, 0)
 	for i := 0; i < numClients; i++ {
-		c := config
+		c = config
 		c.ExternalID = testsutil.GenerateUUID(t)
 		c.ExternalKey = testsutil.GenerateUUID(t)
 		c.Name = fmt.Sprintf("%s-%d", config.Name, i)
 		if i == 41 {
-			c.State = bootstrap.Active
+			c.Status = bootstrap.Active
 		}
 		saved = append(saved, c)
 	}
 
 	cases := []struct {
-		desc                string
-		token               string
-		session             smqauthn.Session
-		userID              string
-		domainID            string
-		config              bootstrap.ConfigsPage
-		filter              bootstrap.Filter
-		offset              uint64
-		limit               uint64
-		listObjectsResponse policysvc.PolicyPage
-		listObjectsErr      error
-		retrieveErr         error
-		err                 error
-		event               map[string]any
+		desc        string
+		token       string
+		session     smqauthn.Session
+		userID      string
+		domainID    string
+		config      bootstrap.ConfigsPage
+		filter      bootstrap.Filter
+		offset      uint64
+		limit       uint64
+		retrieveErr error
+		err         error
+		event       map[string]any
 	}{
 		{
 			desc:     "list successfully as super admin",
@@ -680,16 +468,14 @@ func TestList(t *testing.T) {
 				Limit:   10,
 				Configs: saved[0:10],
 			},
-			filter:              bootstrap.Filter{},
-			offset:              0,
-			limit:               10,
-			listObjectsResponse: policysvc.PolicyPage{},
-			err:                 nil,
+			filter: bootstrap.Filter{},
+			offset: 0,
+			limit:  10,
+			err:    nil,
 			event: map[string]any{
-				"client_id":   c.ClientID,
+				"config_id":   c.ID,
 				"domain_id":   c.DomainID,
 				"name":        c.Name,
-				"channels":    c.Channels,
 				"external_id": c.ExternalID,
 				"content":     c.Content,
 				"timestamp":   time.Now().Unix(),
@@ -708,16 +494,14 @@ func TestList(t *testing.T) {
 				Limit:   10,
 				Configs: saved[0:10],
 			},
-			filter:              bootstrap.Filter{},
-			offset:              0,
-			limit:               10,
-			listObjectsResponse: policysvc.PolicyPage{},
-			err:                 nil,
+			filter: bootstrap.Filter{},
+			offset: 0,
+			limit:  10,
+			err:    nil,
 			event: map[string]any{
-				"client_id":   c.ClientID,
+				"config_id":   c.ID,
 				"domain_id":   c.DomainID,
 				"name":        c.Name,
-				"channels":    c.Channels,
 				"external_id": c.ExternalID,
 				"content":     c.Content,
 				"timestamp":   time.Now().Unix(),
@@ -736,16 +520,14 @@ func TestList(t *testing.T) {
 				Limit:   10,
 				Configs: saved[0:10],
 			},
-			filter:              bootstrap.Filter{},
-			offset:              0,
-			limit:               10,
-			listObjectsResponse: policysvc.PolicyPage{},
-			err:                 nil,
+			filter: bootstrap.Filter{},
+			offset: 0,
+			limit:  10,
+			err:    nil,
 			event: map[string]any{
-				"client_id":   c.ClientID,
+				"config_id":   c.ID,
 				"domain_id":   c.DomainID,
 				"name":        c.Name,
-				"channels":    c.Channels,
 				"external_id": c.ExternalID,
 				"content":     c.Content,
 				"timestamp":   time.Now().Unix(),
@@ -753,73 +535,49 @@ func TestList(t *testing.T) {
 			},
 		},
 		{
-			desc:                "list as non admin with failed list all objects",
-			token:               validToken,
-			userID:              validID,
-			domainID:            domainID,
-			session:             smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
-			filter:              bootstrap.Filter{},
-			offset:              0,
-			limit:               10,
-			listObjectsResponse: policysvc.PolicyPage{},
-			listObjectsErr:      svcerr.ErrNotFound,
-			err:                 svcerr.ErrNotFound,
-			event:               nil,
-		},
-
-		{
-			desc:                "list as super admin with failed retrieve all",
-			token:               validToken,
-			userID:              validID,
-			domainID:            domainID,
-			session:             smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID, SuperAdmin: true},
-			filter:              bootstrap.Filter{},
-			offset:              0,
-			limit:               10,
-			listObjectsResponse: policysvc.PolicyPage{},
-			retrieveErr:         nil,
-			err:                 nil,
-			event:               nil,
+			desc:        "list as super admin with failed retrieve all",
+			token:       validToken,
+			userID:      validID,
+			domainID:    domainID,
+			session:     smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID, SuperAdmin: true},
+			filter:      bootstrap.Filter{},
+			offset:      0,
+			limit:       10,
+			retrieveErr: nil,
+			err:         nil,
+			event:       nil,
 		},
 		{
-			desc:                "list as domain admin with failed retrieve all",
-			token:               validToken,
-			userID:              validID,
-			domainID:            domainID,
-			session:             smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID, SuperAdmin: true},
-			filter:              bootstrap.Filter{},
-			offset:              0,
-			limit:               10,
-			listObjectsResponse: policysvc.PolicyPage{},
-			retrieveErr:         nil,
-			err:                 nil,
-			event:               nil,
+			desc:        "list as domain admin with failed retrieve all",
+			token:       validToken,
+			userID:      validID,
+			domainID:    domainID,
+			session:     smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID, SuperAdmin: true},
+			filter:      bootstrap.Filter{},
+			offset:      0,
+			limit:       10,
+			retrieveErr: nil,
+			err:         nil,
+			event:       nil,
 		},
 		{
-			desc:                "list as non admin with failed retrieve all",
-			token:               validToken,
-			userID:              validID,
-			domainID:            domainID,
-			session:             smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
-			filter:              bootstrap.Filter{},
-			offset:              0,
-			limit:               10,
-			listObjectsResponse: policysvc.PolicyPage{},
-			retrieveErr:         nil,
-			err:                 nil,
-			event:               nil,
+			desc:        "list as non admin with failed retrieve all",
+			token:       validToken,
+			userID:      validID,
+			domainID:    domainID,
+			session:     smqauthn.Session{UserID: validID, DomainID: domainID, DomainUserID: validID},
+			filter:      bootstrap.Filter{},
+			offset:      0,
+			limit:       10,
+			retrieveErr: nil,
+			err:         nil,
+			event:       nil,
 		},
 	}
 
 	lastID := "0"
 	for _, tc := range cases {
-		policyCall := tv.policies.On("ListAllObjects", mock.Anything, policysvc.Policy{
-			SubjectType: policysvc.UserType,
-			Subject:     tc.userID,
-			Permission:  policysvc.ViewPermission,
-			ObjectType:  policysvc.ClientType,
-		}).Return(tc.listObjectsResponse, tc.listObjectsErr)
-		repoCall := tv.boot.On("RetrieveAll", context.Background(), mock.Anything, mock.Anything, tc.filter, tc.offset, tc.limit).Return(tc.config, tc.retrieveErr)
+		repoCall := tv.boot.On("RetrieveAll", context.Background(), mock.Anything, tc.filter, tc.offset, tc.limit).Return(tc.config, tc.retrieveErr)
 
 		_, err := tv.svc.List(context.Background(), tc.session, tc.filter, tc.offset, tc.limit)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
@@ -838,7 +596,6 @@ func TestList(t *testing.T) {
 
 		test(t, tc.event, event, tc.desc)
 
-		policyCall.Unset()
 		repoCall.Unset()
 	}
 }
@@ -850,7 +607,7 @@ func TestRemove(t *testing.T) {
 	tv := newTestVariable(t, redisURL)
 
 	nonExisting := config
-	nonExisting.ClientID = unknownClientID
+	nonExisting.ID = unknownID
 
 	cases := []struct {
 		desc      string
@@ -865,20 +622,20 @@ func TestRemove(t *testing.T) {
 	}{
 		{
 			desc:     "remove config successfully",
-			configID: config.ClientID,
+			configID: config.ID,
 			token:    validToken,
 			userID:   validID,
 			domainID: domainID,
 			err:      nil,
 			event: map[string]any{
-				"client_id": config.ClientID,
+				"config_id": config.ID,
 				"timestamp": time.Now().Unix(),
 				"operation": configRemove,
 			},
 		},
 		{
 			desc:      "remove config with failed removal",
-			configID:  nonExisting.ClientID,
+			configID:  nonExisting.ID,
 			token:     validToken,
 			userID:    validID,
 			domainID:  domainID,
@@ -975,87 +732,64 @@ func TestBootstrap(t *testing.T) {
 	}
 }
 
-func TestChangeState(t *testing.T) {
+func TestEnableConfig(t *testing.T) {
 	err := redisClient.FlushAll(context.Background()).Err()
 	assert.Nil(t, err, fmt.Sprintf("got unexpected error: %s", err))
 
 	tv := newTestVariable(t, redisURL)
 
 	cases := []struct {
-		desc            string
-		id              string
-		userID          string
-		domainID        string
-		token           string
-		session         smqauthn.Session
-		state           bootstrap.State
-		authResponse    smqauthn.Session
-		authorizeErr    error
-		connectErr      error
-		retrieveErr     error
-		stateErr        error
-		authenticateErr error
-		err             error
-		event           map[string]any
+		desc        string
+		id          string
+		userID      string
+		domainID    string
+		session     smqauthn.Session
+		retrieveErr error
+		statusErr   error
+		err         error
+		event       map[string]any
 	}{
 		{
-			desc:         "change state to active",
-			id:           config.ClientID,
-			token:        validToken,
-			userID:       validID,
-			domainID:     domainID,
-			state:        bootstrap.Active,
-			authResponse: smqauthn.Session{},
-			err:          nil,
+			desc:     "enable config",
+			id:       config.ID,
+			userID:   validID,
+			domainID: domainID,
+			err:      nil,
 			event: map[string]any{
-				"client_id": config.ClientID,
-				"state":     bootstrap.Active.String(),
+				"config_id": config.ID,
 				"timestamp": time.Now().Unix(),
-				"operation": clientStateChange,
+				"operation": configEnable,
 			},
 		},
 		{
-			desc:        "change state with failed retrieve by ID",
+			desc:        "enable with failed retrieve by ID",
 			id:          "",
-			token:       validToken,
 			userID:      validID,
 			domainID:    domainID,
-			state:       bootstrap.Active,
 			retrieveErr: svcerr.ErrNotFound,
 			err:         svcerr.ErrNotFound,
 			event:       nil,
 		},
 		{
-			desc:       "change state with failed connect",
-			id:         config.ClientID,
-			token:      validToken,
-			userID:     validID,
-			domainID:   domainID,
-			state:      bootstrap.Active,
-			connectErr: bootstrap.ErrClients,
-			err:        bootstrap.ErrClients,
-			event:      nil,
-		},
-		{
-			desc:     "change state unsuccessfully",
-			id:       config.ClientID,
-			token:    validToken,
-			userID:   validID,
-			domainID: domainID,
-			state:    bootstrap.Active,
-			stateErr: svcerr.ErrUpdateEntity,
-			err:      svcerr.ErrUpdateEntity,
-			event:    nil,
+			desc:      "enable with repo status error",
+			id:        config.ID,
+			userID:    validID,
+			domainID:  domainID,
+			statusErr: svcerr.ErrUpdateEntity,
+			err:       svcerr.ErrUpdateEntity,
+			event:     nil,
 		},
 	}
+
+	disabledConfig := config
+	disabledConfig.Status = bootstrap.DisabledStatus
 
 	lastID := "0"
 	for _, tc := range cases {
 		tc.session = smqauthn.Session{UserID: validID, DomainID: tc.domainID, DomainUserID: validID}
-		repoCall := tv.boot.On("RetrieveByID", context.Background(), tc.domainID, tc.id).Return(config, tc.retrieveErr)
-		sdkCall1 := tv.sdk.On("ConnectClients", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(errors.NewSDKError(tc.connectErr))
-		repoCall1 := tv.boot.On("ChangeState", context.Background(), mock.Anything, mock.Anything, mock.Anything).Return(tc.stateErr)
-		err := tv.svc.ChangeState(context.Background(), tc.session, tc.token, tc.id, tc.state)
+		repoCall := tv.boot.On("RetrieveByID", context.Background(), tc.domainID, tc.id).Return(disabledConfig, tc.retrieveErr)
+		repoCall1 := tv.boot.On("ChangeStatus", context.Background(), mock.Anything, mock.Anything, mock.Anything).Return(tc.statusErr)
+		_, err := tv.svc.EnableConfig(context.Background(), tc.session, tc.id)
 		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 
 		streams := redisClient.XRead(context.Background(), &redis.XReadArgs{
@@ -1071,198 +805,67 @@ func TestChangeState(t *testing.T) {
 		}
 
 		test(t, tc.event, event, tc.desc)
-		sdkCall1.Unset()
 		repoCall.Unset()
 		repoCall1.Unset()
 	}
 }
 
-func TestUpdateChannelHandler(t *testing.T) {
+func TestDisableConfig(t *testing.T) {
 	err := redisClient.FlushAll(context.Background()).Err()
 	assert.Nil(t, err, fmt.Sprintf("got unexpected error: %s", err))
 
 	tv := newTestVariable(t, redisURL)
 
 	cases := []struct {
-		desc    string
-		channel bootstrap.Channel
-		err     error
-		event   map[string]any
+		desc        string
+		id          string
+		userID      string
+		domainID    string
+		session     smqauthn.Session
+		retrieveErr error
+		statusErr   error
+		err         error
+		event       map[string]any
 	}{
 		{
-			desc:    "update channel handler successfully",
-			channel: channel,
-			err:     nil,
-			event: map[string]any{
-				"channel_id":  channel.ID,
-				"metadata":    "{\"name\":\"value\"}",
-				"name":        channel.Name,
-				"operation":   channelUpdateHandler,
-				"timestamp":   time.Now().UnixNano(),
-				"occurred_at": time.Now().UnixNano(),
-			},
-		},
-		{
-			desc:    "update non-existing channel handler",
-			channel: bootstrap.Channel{ID: "unknown", Name: "NonExistingChannel"},
-			err:     nil,
-			event:   nil,
-		},
-		{
-			desc:    "update channel handler with empty ID",
-			channel: bootstrap.Channel{Name: "ChannelWithEmptyID"},
-			err:     nil,
-			event:   nil,
-		},
-		{
-			desc:    "update channel handler with empty name",
-			channel: bootstrap.Channel{ID: "3"},
-			err:     nil,
-			event:   nil,
-		},
-		{
-			desc:    "update channel handler successfully with modified fields",
-			channel: channel,
-			err:     nil,
-			event: map[string]any{
-				"channel_id":  channel.ID,
-				"metadata":    "{\"name\":\"value\"}",
-				"name":        channel.Name,
-				"operation":   channelUpdateHandler,
-				"timestamp":   time.Now().UnixNano(),
-				"occurred_at": time.Now().UnixNano(),
-			},
-		},
-	}
-
-	lastID := "0"
-	for _, tc := range cases {
-		repoCall := tv.boot.On("UpdateChannel", context.Background(), mock.Anything).Return(tc.err)
-		err := tv.svc.UpdateChannelHandler(context.Background(), tc.channel)
-		assert.Equal(t, tc.err, err, fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-
-		streams := redisClient.XRead(context.Background(), &redis.XReadArgs{
-			Streams: []string{streamID, lastID},
-			Count:   1,
-			Block:   time.Second,
-		}).Val()
-
-		var event map[string]any
-		if len(streams) > 0 && len(streams[0].Messages) > 0 {
-			msg := streams[0].Messages[0]
-			event = msg.Values
-			event["timestamp"] = msg.ID
-			lastID = msg.ID
-		}
-		test(t, tc.event, event, tc.desc)
-		repoCall.Unset()
-	}
-}
-
-func TestRemoveChannelHandler(t *testing.T) {
-	err := redisClient.FlushAll(context.Background()).Err()
-	assert.Nil(t, err, fmt.Sprintf("got unexpected error: %s", err))
-
-	tv := newTestVariable(t, redisURL)
-
-	cases := []struct {
-		desc      string
-		channelID string
-		err       error
-		event     map[string]any
-	}{
-		{
-			desc:      "remove channel handler successfully",
-			channelID: channel.ID,
-			err:       nil,
-			event: map[string]any{
-				"config_id":   channel.ID,
-				"operation":   channelHandlerRemove,
-				"timestamp":   time.Now().UnixNano(),
-				"occurred_at": time.Now().UnixNano(),
-			},
-		},
-		{
-			desc:      "remove non-existing channel handler",
-			channelID: "unknown",
-			err:       nil,
-			event:     nil,
-		},
-		{
-			desc:      "remove channel handler with empty ID",
-			channelID: "",
-			err:       nil,
-			event:     nil,
-		},
-	}
-
-	lastID := "0"
-	for _, tc := range cases {
-		repoCall := tv.boot.On("RemoveChannel", context.Background(), mock.Anything).Return(tc.err)
-		err := tv.svc.RemoveChannelHandler(context.Background(), tc.channelID)
-		assert.Equal(t, tc.err, err, fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-
-		streams := redisClient.XRead(context.Background(), &redis.XReadArgs{
-			Streams: []string{streamID, lastID},
-			Count:   1,
-			Block:   time.Second,
-		}).Val()
-
-		var event map[string]any
-		if len(streams) > 0 && len(streams[0].Messages) > 0 {
-			msg := streams[0].Messages[0]
-			event = msg.Values
-			event["timestamp"] = msg.ID
-			lastID = msg.ID
-		}
-
-		test(t, tc.event, event, tc.desc)
-		repoCall.Unset()
-	}
-}
-
-func TestRemoveConfigHandler(t *testing.T) {
-	err := redisClient.FlushAll(context.Background()).Err()
-	assert.Nil(t, err, fmt.Sprintf("got unexpected error: %s", err))
-
-	tv := newTestVariable(t, redisURL)
-
-	cases := []struct {
-		desc     string
-		configID string
-		err      error
-		event    map[string]any
-	}{
-		{
-			desc:     "remove config handler successfully",
-			configID: channel.ID,
+			desc:     "disable config",
+			id:       config.ID,
+			userID:   validID,
+			domainID: domainID,
 			err:      nil,
 			event: map[string]any{
-				"config_id":   channel.ID,
-				"operation":   configHandlerRemove,
-				"timestamp":   time.Now().UnixNano(),
-				"occurred_at": time.Now().UnixNano(),
+				"config_id": config.ID,
+				"timestamp": time.Now().Unix(),
+				"operation": configDisable,
 			},
 		},
 		{
-			desc:     "remove non-existing config handler",
-			configID: "unknown",
-			err:      nil,
-			event:    nil,
+			desc:        "disable with failed retrieve by ID",
+			id:          "",
+			userID:      validID,
+			domainID:    domainID,
+			retrieveErr: svcerr.ErrNotFound,
+			err:         svcerr.ErrNotFound,
+			event:       nil,
 		},
 		{
-			desc:     "remove config handler with empty ID",
-			configID: "",
-			err:      nil,
-			event:    nil,
+			desc:      "disable with repo status error",
+			id:        config.ID,
+			userID:    validID,
+			domainID:  domainID,
+			statusErr: svcerr.ErrUpdateEntity,
+			err:       svcerr.ErrUpdateEntity,
+			event:     nil,
 		},
 	}
 
 	lastID := "0"
 	for _, tc := range cases {
-		repoCall := tv.boot.On("RemoveClient", context.Background(), mock.Anything).Return(tc.err)
-		err := tv.svc.RemoveConfigHandler(context.Background(), tc.configID)
-		assert.Equal(t, tc.err, err, fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
+		tc.session = smqauthn.Session{UserID: validID, DomainID: tc.domainID, DomainUserID: validID}
+		repoCall := tv.boot.On("RetrieveByID", context.Background(), tc.domainID, tc.id).Return(config, tc.retrieveErr)
+		repoCall1 := tv.boot.On("ChangeStatus", context.Background(), mock.Anything, mock.Anything, mock.Anything).Return(tc.statusErr)
+		_, err := tv.svc.DisableConfig(context.Background(), tc.session, tc.id)
+		assert.True(t, errors.Contains(err, tc.err), fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
 
 		streams := redisClient.XRead(context.Background(), &redis.XReadArgs{
 			Streams: []string{streamID, lastID},
@@ -1272,172 +875,13 @@ func TestRemoveConfigHandler(t *testing.T) {
 
 		var event map[string]any
 		if len(streams) > 0 && len(streams[0].Messages) > 0 {
-			msg := streams[0].Messages[0]
-			event = msg.Values
-			event["timestamp"] = msg.ID
-			lastID = msg.ID
+			event := streams[0].Messages
+			lastID = event[0].ID
 		}
 
 		test(t, tc.event, event, tc.desc)
 		repoCall.Unset()
-	}
-}
-
-func TestConnectClientHandler(t *testing.T) {
-	err := redisClient.FlushAll(context.Background()).Err()
-	assert.Nil(t, err, fmt.Sprintf("got unexpected error: %s", err))
-
-	tv := newTestVariable(t, redisURL)
-
-	cases := []struct {
-		desc      string
-		channelID string
-		clientID  string
-		err       error
-		event     map[string]any
-	}{
-		{
-			desc:      "connect client handler successfully",
-			channelID: channel.ID,
-			clientID:  "1",
-			err:       nil,
-			event: map[string]any{
-				"channel_id":  channel.ID,
-				"client_id":   "1",
-				"operation":   clientConnect,
-				"timestamp":   time.Now().UnixNano(),
-				"occurred_at": time.Now().UnixNano(),
-			},
-		},
-		{
-			desc:      "connect non-existing client handler",
-			channelID: channel.ID,
-			clientID:  "unknown",
-			err:       nil,
-			event:     nil,
-		},
-		{
-			desc:      "connect client handler with empty client ID",
-			channelID: channel.ID,
-			clientID:  "",
-			err:       nil,
-			event:     nil,
-		},
-		{
-			desc:      "connect client handler with empty channel ID",
-			channelID: "",
-			clientID:  "1",
-			err:       nil,
-			event:     nil,
-		},
-	}
-
-	lastID := "0"
-	for _, tc := range cases {
-		repoCall := tv.boot.On("ConnectClient", context.Background(), mock.Anything, mock.Anything).Return(tc.err)
-		err := tv.svc.ConnectClientHandler(context.Background(), tc.channelID, tc.clientID)
-		assert.Equal(t, tc.err, err, fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-
-		streams := redisClient.XRead(context.Background(), &redis.XReadArgs{
-			Streams: []string{streamID, lastID},
-			Count:   1,
-			Block:   time.Second,
-		}).Val()
-
-		var event map[string]any
-		if len(streams) > 0 && len(streams[0].Messages) > 0 {
-			msg := streams[0].Messages[0]
-			event = msg.Values
-			event["timestamp"] = msg.ID
-			lastID = msg.ID
-		}
-
-		test(t, tc.event, event, tc.desc)
-		repoCall.Unset()
-	}
-}
-
-func TestDisconnectClientHandler(t *testing.T) {
-	err := redisClient.FlushAll(context.Background()).Err()
-	assert.Nil(t, err, fmt.Sprintf("got unexpected error: %s", err))
-
-	tv := newTestVariable(t, redisURL)
-
-	cases := []struct {
-		desc      string
-		channelID string
-		clientID  string
-		err       error
-		event     map[string]any
-	}{
-		{
-			desc:      "disconnect client handler successfully",
-			channelID: channel.ID,
-			clientID:  "1",
-			err:       nil,
-			event: map[string]any{
-				"channel_id":  channel.ID,
-				"client_id":   "1",
-				"operation":   clientDisconnect,
-				"timestamp":   time.Now().UnixNano(),
-				"occurred_at": time.Now().UnixNano(),
-			},
-		},
-		{
-			desc:      "remove non-existing client handler",
-			channelID: "unknown",
-			err:       nil,
-		},
-		{
-			desc:      "remove client handler with empty client ID",
-			channelID: channel.ID,
-			clientID:  "",
-			err:       nil,
-			event:     nil,
-		},
-		{
-			desc:      "remove client handler with empty channel ID",
-			channelID: "",
-			err:       nil,
-			event:     nil,
-		},
-		{
-			desc:      "remove client handler successfully",
-			channelID: channel.ID,
-			clientID:  "1",
-			err:       nil,
-			event: map[string]any{
-				"channel_id":  channel.ID,
-				"client_id":   "1",
-				"operation":   clientDisconnect,
-				"timestamp":   time.Now().UnixNano(),
-				"occurred_at": time.Now().UnixNano(),
-			},
-		},
-	}
-
-	lastID := "0"
-	for _, tc := range cases {
-		repoCall := tv.boot.On("DisconnectClient", context.Background(), tc.channelID, tc.clientID).Return(tc.err)
-		err := tv.svc.DisconnectClientHandler(context.Background(), tc.channelID, tc.clientID)
-		assert.Equal(t, tc.err, err, fmt.Sprintf("%s: expected %s got %s\n", tc.desc, tc.err, err))
-
-		streams := redisClient.XRead(context.Background(), &redis.XReadArgs{
-			Streams: []string{streamID, lastID},
-			Count:   1,
-			Block:   time.Second,
-		}).Val()
-
-		var event map[string]any
-		if len(streams) > 0 && len(streams[0].Messages) > 0 {
-			msg := streams[0].Messages[0]
-			event = msg.Values
-			event["timestamp"] = msg.ID
-			lastID = msg.ID
-		}
-
-		test(t, tc.event, event, tc.desc)
-		repoCall.Unset()
+		repoCall1.Unset()
 	}
 }
 
@@ -1463,17 +907,6 @@ func test(t *testing.T, expected, actual map[string]any, description string) {
 		if assert.WithinDuration(t, time.Unix(oa1, 0), time.Unix(oa2, 0), time.Second, fmt.Sprintf("%s: occurred_at is not in valid range of 1 second", description)) {
 			delete(expected, "occurred_at")
 			delete(actual, "occurred_at")
-		}
-
-		exchs := expected["channels"].([]any)
-		achs := actual["channels"].([]any)
-
-		if exchs != nil && achs != nil {
-			if assert.Len(t, exchs, len(achs), fmt.Sprintf("%s: got incorrect number of channels\n", description)) {
-				for _, exch := range exchs {
-					assert.Contains(t, achs, exch, fmt.Sprintf("%s: got incorrect channel\n", description))
-				}
-			}
 		}
 
 		assert.Equal(t, expected, actual, fmt.Sprintf("%s: got incorrect event\n", description))

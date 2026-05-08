@@ -14,21 +14,23 @@ import (
 var _ bootstrap.Service = (*eventStore)(nil)
 
 const (
-	magistralaPrefix           = "magistrala."
-	createStream               = magistralaPrefix + configCreate
-	viewStream                 = magistralaPrefix + configView
-	listStream                 = magistralaPrefix + configList
-	updateStream               = magistralaPrefix + configUpdate
-	removeStream               = magistralaPrefix + configRemove
-	updateCertStream           = magistralaPrefix + certUpdate
-	updateConnectionsStream    = magistralaPrefix + clientUpdateConnections
-	removeHandlerStream        = magistralaPrefix + configHandlerRemove
-	bootstrapStream            = magistralaPrefix + clientBootstrap
-	stateChangeStream          = magistralaPrefix + clientStateChange
-	connectStream              = magistralaPrefix + clientConnect
-	disconnectStream           = magistralaPrefix + clientDisconnect
-	updateHandlerStream        = magistralaPrefix + channelUpdateHandler
-	removeChannelHandlerStream = magistralaPrefix + channelHandlerRemove
+	magistralaPrefix      = "magistrala."
+	createStream          = magistralaPrefix + configCreate
+	listStream            = magistralaPrefix + configList
+	removeStream          = magistralaPrefix + configRemove
+	updateCertStream      = magistralaPrefix + certUpdate
+	bootstrapStream       = magistralaPrefix + clientBootstrap
+	enableConfigStream    = magistralaPrefix + configEnable
+	disableConfigStream   = magistralaPrefix + configDisable
+	createProfileStream   = magistralaPrefix + profileCreate
+	viewProfileStream     = magistralaPrefix + profileView
+	updateProfileStream   = magistralaPrefix + profileUpdate
+	listProfilesStream    = magistralaPrefix + profileList
+	deleteProfileStream   = magistralaPrefix + profileDelete
+	assignProfileStream   = magistralaPrefix + profileAssign
+	bindResourcesStream   = magistralaPrefix + bindingsBind
+	listBindingsStream    = magistralaPrefix + bindingsList
+	refreshBindingsStream = magistralaPrefix + bindingsRefresh
 )
 
 type eventStore struct {
@@ -71,7 +73,7 @@ func (es *eventStore) View(ctx context.Context, session smqauthn.Session, id str
 		cfg, configView,
 	}
 
-	if err := es.Publish(ctx, configView, ev); err != nil {
+	if err := es.Publish(ctx, magistralaPrefix+configView, ev); err != nil {
 		return cfg, err
 	}
 
@@ -87,17 +89,17 @@ func (es *eventStore) Update(ctx context.Context, session smqauthn.Session, cfg 
 		cfg, configUpdate,
 	}
 
-	return es.Publish(ctx, configUpdate, ev)
+	return es.Publish(ctx, magistralaPrefix+configUpdate, ev)
 }
 
-func (es eventStore) UpdateCert(ctx context.Context, session smqauthn.Session, clientID, clientCert, clientKey, caCert string) (bootstrap.Config, error) {
-	cfg, err := es.svc.UpdateCert(ctx, session, clientID, clientCert, clientKey, caCert)
+func (es eventStore) UpdateCert(ctx context.Context, session smqauthn.Session, id, clientCert, clientKey, caCert string) (bootstrap.Config, error) {
+	cfg, err := es.svc.UpdateCert(ctx, session, id, clientCert, clientKey, caCert)
 	if err != nil {
 		return cfg, err
 	}
 
 	ev := updateCertEvent{
-		clientID:   clientID,
+		configID:   id,
 		clientCert: clientCert,
 		clientKey:  clientKey,
 		caCert:     caCert,
@@ -108,19 +110,6 @@ func (es eventStore) UpdateCert(ctx context.Context, session smqauthn.Session, c
 	}
 
 	return cfg, nil
-}
-
-func (es *eventStore) UpdateConnections(ctx context.Context, session smqauthn.Session, token, id string, connections []string) error {
-	if err := es.svc.UpdateConnections(ctx, session, token, id, connections); err != nil {
-		return err
-	}
-
-	ev := updateConnectionsEvent{
-		mgClient:   id,
-		mgChannels: connections,
-	}
-
-	return es.Publish(ctx, updateConnectionsStream, ev)
 }
 
 func (es *eventStore) List(ctx context.Context, session smqauthn.Session, filter bootstrap.Filter, offset, limit uint64) (bootstrap.ConfigsPage, error) {
@@ -149,7 +138,7 @@ func (es *eventStore) Remove(ctx context.Context, session smqauthn.Session, id s
 	}
 
 	ev := removeConfigEvent{
-		client: id,
+		config: id,
 	}
 
 	return es.Publish(ctx, removeStream, ev)
@@ -175,79 +164,120 @@ func (es *eventStore) Bootstrap(ctx context.Context, externalKey, externalID str
 	return cfg, err
 }
 
-func (es *eventStore) ChangeState(ctx context.Context, session smqauthn.Session, token, id string, state bootstrap.State) error {
-	if err := es.svc.ChangeState(ctx, session, token, id, state); err != nil {
-		return err
+func (es *eventStore) EnableConfig(ctx context.Context, session smqauthn.Session, id string) (bootstrap.Config, error) {
+	cfg, err := es.svc.EnableConfig(ctx, session, id)
+	if err != nil {
+		return cfg, err
 	}
 
-	ev := changeStateEvent{
-		mgClient: id,
-		state:    state,
+	ev := enableConfigEvent{configID: id}
+	if err := es.Publish(ctx, enableConfigStream, ev); err != nil {
+		return cfg, err
 	}
-
-	return es.Publish(ctx, stateChangeStream, ev)
+	return cfg, nil
 }
 
-func (es *eventStore) RemoveConfigHandler(ctx context.Context, id string) error {
-	if err := es.svc.RemoveConfigHandler(ctx, id); err != nil {
-		return err
+func (es *eventStore) DisableConfig(ctx context.Context, session smqauthn.Session, id string) (bootstrap.Config, error) {
+	cfg, err := es.svc.DisableConfig(ctx, session, id)
+	if err != nil {
+		return cfg, err
 	}
 
-	ev := removeHandlerEvent{
-		id:        id,
-		operation: configHandlerRemove,
+	ev := disableConfigEvent{configID: id}
+	if err := es.Publish(ctx, disableConfigStream, ev); err != nil {
+		return cfg, err
 	}
-
-	return es.Publish(ctx, removeHandlerStream, ev)
+	return cfg, nil
 }
 
-func (es *eventStore) RemoveChannelHandler(ctx context.Context, id string) error {
-	if err := es.svc.RemoveChannelHandler(ctx, id); err != nil {
-		return err
+func (es *eventStore) CreateProfile(ctx context.Context, session smqauthn.Session, p bootstrap.Profile) (bootstrap.Profile, error) {
+	saved, err := es.svc.CreateProfile(ctx, session, p)
+	if err != nil {
+		return saved, err
 	}
-
-	ev := removeHandlerEvent{
-		id:        id,
-		operation: channelHandlerRemove,
+	ev := profileEvent{saved, profileCreate}
+	if err := es.Publish(ctx, createProfileStream, ev); err != nil {
+		return saved, err
 	}
-
-	return es.Publish(ctx, removeChannelHandlerStream, ev)
+	return saved, nil
 }
 
-func (es *eventStore) UpdateChannelHandler(ctx context.Context, channel bootstrap.Channel) error {
-	if err := es.svc.UpdateChannelHandler(ctx, channel); err != nil {
-		return err
+func (es *eventStore) ViewProfile(ctx context.Context, session smqauthn.Session, profileID string) (bootstrap.Profile, error) {
+	p, err := es.svc.ViewProfile(ctx, session, profileID)
+	if err != nil {
+		return p, err
 	}
-
-	ev := updateChannelHandlerEvent{
-		channel,
+	ev := profileEvent{p, profileView}
+	if err := es.Publish(ctx, viewProfileStream, ev); err != nil {
+		return p, err
 	}
-
-	return es.Publish(ctx, updateStream, ev)
+	return p, nil
 }
 
-func (es *eventStore) ConnectClientHandler(ctx context.Context, channelID, clientID string) error {
-	if err := es.svc.ConnectClientHandler(ctx, channelID, clientID); err != nil {
+func (es *eventStore) UpdateProfile(ctx context.Context, session smqauthn.Session, p bootstrap.Profile) error {
+	if err := es.svc.UpdateProfile(ctx, session, p); err != nil {
 		return err
 	}
-
-	ev := connectClientEvent{
-		clientID:  clientID,
-		channelID: channelID,
-	}
-
-	return es.Publish(ctx, connectStream, ev)
+	ev := profileEvent{p, profileUpdate}
+	return es.Publish(ctx, updateProfileStream, ev)
 }
 
-func (es *eventStore) DisconnectClientHandler(ctx context.Context, channelID, clientID string) error {
-	if err := es.svc.DisconnectClientHandler(ctx, channelID, clientID); err != nil {
+func (es *eventStore) ListProfiles(ctx context.Context, session smqauthn.Session, offset, limit uint64) (bootstrap.ProfilesPage, error) {
+	pp, err := es.svc.ListProfiles(ctx, session, offset, limit)
+	if err != nil {
+		return pp, err
+	}
+	ev := profileEvent{operation: profileList}
+	if err := es.Publish(ctx, listProfilesStream, ev); err != nil {
+		return pp, err
+	}
+	return pp, nil
+}
+
+func (es *eventStore) DeleteProfile(ctx context.Context, session smqauthn.Session, profileID string) error {
+	if err := es.svc.DeleteProfile(ctx, session, profileID); err != nil {
 		return err
 	}
+	ev := deleteProfileEvent{profileID: profileID}
+	return es.Publish(ctx, deleteProfileStream, ev)
+}
 
-	ev := disconnectClientEvent{
-		clientID:  clientID,
-		channelID: channelID,
+func (es *eventStore) AssignProfile(ctx context.Context, session smqauthn.Session, configID, profileID string) error {
+	if err := es.svc.AssignProfile(ctx, session, configID, profileID); err != nil {
+		return err
 	}
+	ev := assignProfileEvent{configID: configID, profileID: profileID}
+	return es.Publish(ctx, assignProfileStream, ev)
+}
 
-	return es.Publish(ctx, disconnectStream, ev)
+func (es *eventStore) BindResources(ctx context.Context, session smqauthn.Session, token, configID string, bindings []bootstrap.BindingRequest) error {
+	if err := es.svc.BindResources(ctx, session, token, configID, bindings); err != nil {
+		return err
+	}
+	slots := make([]string, len(bindings))
+	for i, b := range bindings {
+		slots[i] = b.Slot
+	}
+	ev := bindResourcesEvent{configID: configID, slots: slots}
+	return es.Publish(ctx, bindResourcesStream, ev)
+}
+
+func (es *eventStore) ListBindings(ctx context.Context, session smqauthn.Session, configID string) ([]bootstrap.BindingSnapshot, error) {
+	bs, err := es.svc.ListBindings(ctx, session, configID)
+	if err != nil {
+		return bs, err
+	}
+	ev := listBindingsEvent{configID: configID}
+	if err := es.Publish(ctx, listBindingsStream, ev); err != nil {
+		return bs, err
+	}
+	return bs, nil
+}
+
+func (es *eventStore) RefreshBindings(ctx context.Context, session smqauthn.Session, token, configID string) error {
+	if err := es.svc.RefreshBindings(ctx, session, token, configID); err != nil {
+		return err
+	}
+	ev := refreshBindingsEvent{configID: configID}
+	return es.Publish(ctx, refreshBindingsStream, ev)
 }

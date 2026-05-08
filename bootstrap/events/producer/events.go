@@ -9,37 +9,45 @@ import (
 )
 
 const (
-	configPrefix        = "bootstrap.config."
-	configCreate        = configPrefix + "create"
-	configUpdate        = configPrefix + "update"
-	configRemove        = configPrefix + "remove"
-	configView          = configPrefix + "view"
-	configList          = configPrefix + "list"
-	configHandlerRemove = configPrefix + "remove_handler"
+	configPrefix    = "bootstrap.config."
+	configCreate    = configPrefix + "create"
+	configUpdate    = configPrefix + "update"
+	configRemove    = configPrefix + "remove"
+	configView      = configPrefix + "view"
+	configList      = configPrefix + "list"
+	clientPrefix    = "bootstrap.client."
+	clientBootstrap = clientPrefix + "bootstrap"
+	configEnable    = configPrefix + "enable"
+	configDisable   = configPrefix + "disable"
+	certUpdate      = "bootstrap.cert.update"
 
-	clientPrefix            = "bootstrap.client."
-	clientBootstrap         = clientPrefix + "bootstrap"
-	clientStateChange       = clientPrefix + "change_state"
-	clientUpdateConnections = clientPrefix + "update_connections"
-	clientConnect           = clientPrefix + "connect"
-	clientDisconnect        = clientPrefix + "disconnect"
-
-	channelPrefix        = "bootstrap.channel."
-	channelHandlerRemove = channelPrefix + "remove_handler"
-	channelUpdateHandler = channelPrefix + "update_handler"
-
-	certUpdate = "bootstrap.cert.update"
+	profilePrefix   = "bootstrap.profile."
+	profileCreate   = profilePrefix + "create"
+	profileView     = profilePrefix + "view"
+	profileUpdate   = profilePrefix + "update"
+	profileList     = profilePrefix + "list"
+	profileDelete   = profilePrefix + "delete"
+	profileAssign   = profilePrefix + "assign"
+	bindingsPrefix  = "bootstrap.bindings."
+	bindingsBind    = bindingsPrefix + "bind"
+	bindingsList    = bindingsPrefix + "list"
+	bindingsRefresh = bindingsPrefix + "refresh"
 )
 
 var (
 	_ events.Event = (*configEvent)(nil)
 	_ events.Event = (*removeConfigEvent)(nil)
 	_ events.Event = (*bootstrapEvent)(nil)
-	_ events.Event = (*changeStateEvent)(nil)
-	_ events.Event = (*updateConnectionsEvent)(nil)
+	_ events.Event = (*enableConfigEvent)(nil)
+	_ events.Event = (*disableConfigEvent)(nil)
 	_ events.Event = (*updateCertEvent)(nil)
 	_ events.Event = (*listConfigsEvent)(nil)
-	_ events.Event = (*removeHandlerEvent)(nil)
+	_ events.Event = (*profileEvent)(nil)
+	_ events.Event = (*deleteProfileEvent)(nil)
+	_ events.Event = (*assignProfileEvent)(nil)
+	_ events.Event = (*bindResourcesEvent)(nil)
+	_ events.Event = (*listBindingsEvent)(nil)
+	_ events.Event = (*refreshBindingsEvent)(nil)
 )
 
 type configEvent struct {
@@ -49,30 +57,23 @@ type configEvent struct {
 
 func (ce configEvent) Encode() (map[string]any, error) {
 	val := map[string]any{
-		"state":     ce.State.String(),
+		"status":    ce.Status.String(),
 		"operation": ce.operation,
 	}
-	if ce.ClientID != "" {
-		val["client_id"] = ce.ClientID
+	if ce.ID != "" {
+		val["config_id"] = ce.ID
 	}
 	if ce.Content != "" {
 		val["content"] = ce.Content
 	}
 	if ce.DomainID != "" {
-		val["domain_id "] = ce.DomainID
+		val["domain_id"] = ce.DomainID
 	}
 	if ce.Name != "" {
 		val["name"] = ce.Name
 	}
 	if ce.ExternalID != "" {
 		val["external_id"] = ce.ExternalID
-	}
-	if len(ce.Channels) > 0 {
-		channels := make([]string, len(ce.Channels))
-		for i, ch := range ce.Channels {
-			channels[i] = ch.ID
-		}
-		val["channels"] = channels
 	}
 	if ce.ClientCert != "" {
 		val["client_cert"] = ce.ClientCert
@@ -91,12 +92,12 @@ func (ce configEvent) Encode() (map[string]any, error) {
 }
 
 type removeConfigEvent struct {
-	client string
+	config string
 }
 
 func (rce removeConfigEvent) Encode() (map[string]any, error) {
 	return map[string]any{
-		"client_id": rce.client,
+		"config_id": rce.config,
 		"operation": configRemove,
 	}, nil
 }
@@ -137,27 +138,20 @@ func (be bootstrapEvent) Encode() (map[string]any, error) {
 		"operation":   clientBootstrap,
 	}
 
-	if be.ClientID != "" {
-		val["client_id"] = be.ClientID
+	if be.ID != "" {
+		val["config_id"] = be.ID
 	}
 	if be.Content != "" {
 		val["content"] = be.Content
 	}
 	if be.DomainID != "" {
-		val["domain_id "] = be.DomainID
+		val["domain_id"] = be.DomainID
 	}
 	if be.Name != "" {
 		val["name"] = be.Name
 	}
 	if be.ExternalID != "" {
 		val["external_id"] = be.ExternalID
-	}
-	if len(be.Channels) > 0 {
-		channels := make([]string, len(be.Channels))
-		for i, ch := range be.Channels {
-			channels[i] = ch.ID
-		}
-		val["channels"] = channels
 	}
 	if be.ClientCert != "" {
 		val["client_cert"] = be.ClientCert
@@ -174,34 +168,30 @@ func (be bootstrapEvent) Encode() (map[string]any, error) {
 	return val, nil
 }
 
-type changeStateEvent struct {
-	mgClient string
-	state    bootstrap.State
+type enableConfigEvent struct {
+	configID string
 }
 
-func (cse changeStateEvent) Encode() (map[string]any, error) {
+func (e enableConfigEvent) Encode() (map[string]any, error) {
 	return map[string]any{
-		"client_id": cse.mgClient,
-		"state":     cse.state.String(),
-		"operation": clientStateChange,
+		"config_id": e.configID,
+		"operation": configEnable,
 	}, nil
 }
 
-type updateConnectionsEvent struct {
-	mgClient   string
-	mgChannels []string
+type disableConfigEvent struct {
+	configID string
 }
 
-func (uce updateConnectionsEvent) Encode() (map[string]any, error) {
+func (e disableConfigEvent) Encode() (map[string]any, error) {
 	return map[string]any{
-		"client_id": uce.mgClient,
-		"channels":  uce.mgChannels,
-		"operation": clientUpdateConnections,
+		"config_id": e.configID,
+		"operation": configDisable,
 	}, nil
 }
 
 type updateCertEvent struct {
-	clientID   string
+	configID   string
 	clientCert string
 	clientKey  string
 	caCert     string
@@ -209,7 +199,7 @@ type updateCertEvent struct {
 
 func (uce updateCertEvent) Encode() (map[string]any, error) {
 	return map[string]any{
-		"client_id":   uce.clientID,
+		"config_id":   uce.configID,
 		"client_cert": uce.clientCert,
 		"client_key":  uce.clientKey,
 		"ca_cert":     uce.caCert,
@@ -217,61 +207,82 @@ func (uce updateCertEvent) Encode() (map[string]any, error) {
 	}, nil
 }
 
-type removeHandlerEvent struct {
-	id        string
+type profileEvent struct {
+	bootstrap.Profile
 	operation string
 }
 
-func (rhe removeHandlerEvent) Encode() (map[string]any, error) {
-	return map[string]any{
-		"config_id": rhe.id,
-		"operation": rhe.operation,
-	}, nil
-}
-
-type updateChannelHandlerEvent struct {
-	bootstrap.Channel
-}
-
-func (uche updateChannelHandlerEvent) Encode() (map[string]any, error) {
+func (pe profileEvent) Encode() (map[string]any, error) {
 	val := map[string]any{
-		"operation": channelUpdateHandler,
+		"operation": pe.operation,
 	}
-
-	if uche.ID != "" {
-		val["channel_id"] = uche.ID
+	if pe.ID != "" {
+		val["profile_id"] = pe.ID
 	}
-	if uche.Name != "" {
-		val["name"] = uche.Name
+	if pe.DomainID != "" {
+		val["domain_id"] = pe.DomainID
 	}
-	if uche.Metadata != nil {
-		val["metadata"] = uche.Metadata
+	if pe.Name != "" {
+		val["name"] = pe.Name
 	}
 	return val, nil
 }
 
-type connectClientEvent struct {
-	clientID  string
-	channelID string
+type deleteProfileEvent struct {
+	profileID string
 }
 
-func (cte connectClientEvent) Encode() (map[string]any, error) {
+func (dpe deleteProfileEvent) Encode() (map[string]any, error) {
 	return map[string]any{
-		"client_id":  cte.clientID,
-		"channel_id": cte.channelID,
-		"operation":  clientConnect,
+		"profile_id": dpe.profileID,
+		"operation":  profileDelete,
 	}, nil
 }
 
-type disconnectClientEvent struct {
-	clientID  string
-	channelID string
+type assignProfileEvent struct {
+	configID  string
+	profileID string
 }
 
-func (dte disconnectClientEvent) Encode() (map[string]any, error) {
+func (ape assignProfileEvent) Encode() (map[string]any, error) {
 	return map[string]any{
-		"client_id":  dte.clientID,
-		"channel_id": dte.channelID,
-		"operation":  clientDisconnect,
+		"config_id":  ape.configID,
+		"profile_id": ape.profileID,
+		"operation":  profileAssign,
+	}, nil
+}
+
+type bindResourcesEvent struct {
+	configID string
+	slots    []string
+}
+
+func (bre bindResourcesEvent) Encode() (map[string]any, error) {
+	return map[string]any{
+		"config_id": bre.configID,
+		"slots":     bre.slots,
+		"operation": bindingsBind,
+	}, nil
+}
+
+type listBindingsEvent struct {
+	configID string
+}
+
+func (lbe listBindingsEvent) Encode() (map[string]any, error) {
+	return map[string]any{
+		"config_id": lbe.configID,
+		"operation": bindingsList,
+	}, nil
+}
+
+type refreshBindingsEvent struct {
+	configID string
+}
+
+func (rbe refreshBindingsEvent) Encode() (map[string]any, error) {
+	return map[string]any{
+		"config_id": rbe.configID,
+		"operation": bindingsRefresh,
 	}, nil
 }
